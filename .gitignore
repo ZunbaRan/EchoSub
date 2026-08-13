@@ -1,0 +1,9 @@
+.DS_Store
+**/.build/
+**/dist/
+*.xcuserstate
+DerivedData/
+
+# Local EchoSub data and plaintext API credentials
+credentials.json
+library.json
