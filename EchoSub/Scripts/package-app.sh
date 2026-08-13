@@ -13,7 +13,7 @@ swift build --disable-sandbox -c "$CONFIGURATION"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 cp "$PROJECT_DIR/.build/arm64-apple-macosx/$CONFIGURATION/EchoSub" "$CONTENTS_DIR/MacOS/EchoSub"
 cp "$PROJECT_DIR/Support/Info.plist" "$CONTENTS_DIR/Info.plist"
-cp "$PROJECT_DIR/Support/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
+cp "$PROJECT_DIR/Support/AppIcon-v2.icns" "$CONTENTS_DIR/Resources/AppIcon-v2.icns"
 chmod 755 "$CONTENTS_DIR/MacOS/EchoSub"
 
 codesign --force --deep --sign - "$APP_DIR"

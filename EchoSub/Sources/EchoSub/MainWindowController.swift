@@ -568,10 +568,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     }
 
     private func refreshSubtitleAppearance() {
-        if subtitleTable.numberOfRows > 0 {
-            subtitleTable.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<subtitleTable.numberOfRows))
-        }
+        invalidateSubtitleRowHeights()
         subtitleTable.reloadData()
+    }
+
+    private func invalidateSubtitleRowHeights() {
+        guard subtitleTable.numberOfRows > 0 else { return }
+        subtitleTable.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<subtitleTable.numberOfRows))
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -646,9 +649,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
 
     @objc private func modeChanged() {
         settings.subtitleMode = SubtitleDisplayMode(rawValue: modeControl.selectedSegment) ?? .bilingual
-        if subtitleTable.numberOfRows > 0 {
-            subtitleTable.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<subtitleTable.numberOfRows))
-        }
+        invalidateSubtitleRowHeights()
         subtitleTable.reloadData()
     }
     @objc private func toggleFollow() { autoFollow.toggle(); refreshFollowButton(); if autoFollow { refreshPlaybackPosition() } }
@@ -887,6 +888,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         lastSubtitleWidth = right
         splitView.setPosition(left, ofDividerAt: 0)
         splitView.setPosition(splitView.bounds.width - right - splitView.dividerThickness, ofDividerAt: 1)
+        splitView.layoutSubtreeIfNeeded()
+        invalidateSubtitleRowHeights()
     }
 
     func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
@@ -919,9 +922,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             lastSubtitleWidth = right
             UserDefaults.standard.set(Double(right), forKey: "mainSubtitleWidth")
         }
-        if subtitleTable.numberOfRows > 0 {
-            subtitleTable.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<subtitleTable.numberOfRows))
-        }
+        invalidateSubtitleRowHeights()
     }
 
     func windowWillClose(_ notification: Notification) {
