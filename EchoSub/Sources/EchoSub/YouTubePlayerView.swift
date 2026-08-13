@@ -2,6 +2,7 @@ import AppKit
 import WebKit
 
 protocol YouTubePlayerViewDelegate: AnyObject {
+    func playerViewDidBecomeReady(_ view: YouTubePlayerView)
     func playerView(_ view: YouTubePlayerView, didUpdateTime time: Double)
     func playerView(_ view: YouTubePlayerView, didChangeState state: Int)
     func playerView(_ view: YouTubePlayerView, didFailWithCode code: Int)
@@ -87,7 +88,9 @@ final class YouTubePlayerView: NSView, WKScriptMessageHandler, WKNavigationDeleg
         guard let body = message.body as? [String: Any], let type = body["type"] as? String else { return }
         let value = (body["value"] as? NSNumber)?.doubleValue ?? 0
         switch type {
-        case "ready": isReady = true
+        case "ready":
+            isReady = true
+            delegate?.playerViewDidBecomeReady(self)
         case "time": delegate?.playerView(self, didUpdateTime: value)
         case "state": delegate?.playerView(self, didChangeState: Int(value))
         case "error": delegate?.playerView(self, didFailWithCode: Int(value))

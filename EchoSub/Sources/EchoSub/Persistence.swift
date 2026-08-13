@@ -140,6 +140,14 @@ final class AppSettings {
         set { defaults.set(newValue, forKey: "autoFollow"); changed() }
     }
 
+    var playbackLoopMode: PlaybackLoopMode {
+        get {
+            guard defaults.object(forKey: "playbackLoopMode") != nil else { return .none }
+            return PlaybackLoopMode(rawValue: defaults.integer(forKey: "playbackLoopMode")) ?? .none
+        }
+        set { defaults.set(newValue.rawValue, forKey: "playbackLoopMode"); changed() }
+    }
+
     var translationBaseURL: String {
         get { defaults.string(forKey: "translationBaseURL") ?? "https://api.openai.com/v1" }
         set { defaults.set(newValue, forKey: "translationBaseURL"); changed() }
@@ -229,7 +237,7 @@ final class AppSettings {
     var supadataAPIKey: String { PlaintextCredentialStore.shared.loadSupadataAPIKey() }
 
     func reset() {
-        ["subtitleMode", "autoFollow", "translationBaseURL", "translationModel", "overlayFontSize", "desktopEnglishFontSize", "desktopChineseFontSize", "overlayPlateEnabled", "desktopLyricsBackgroundOpacity", "floatingBackgroundOpacity", "subtitlePaletteID", "englishColorHex", "chineseColorHex", "englishFillHex", "englishEdgeHex", "chineseFillHex", "chineseEdgeHex", "floatPinned", "showsOnAllSpaces", "mainPlaylistWidth", "mainSubtitleWidth"].forEach(defaults.removeObject(forKey:))
+        ["subtitleMode", "autoFollow", "playbackLoopMode", "translationBaseURL", "translationModel", "overlayFontSize", "desktopEnglishFontSize", "desktopChineseFontSize", "overlayPlateEnabled", "desktopLyricsBackgroundOpacity", "floatingBackgroundOpacity", "subtitlePaletteID", "englishColorHex", "chineseColorHex", "englishFillHex", "englishEdgeHex", "chineseFillHex", "chineseEdgeHex", "floatPinned", "showsOnAllSpaces", "mainPlaylistWidth", "mainSubtitleWidth"].forEach(defaults.removeObject(forKey:))
         changed()
     }
 

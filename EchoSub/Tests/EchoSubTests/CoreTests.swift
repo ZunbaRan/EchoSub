@@ -183,4 +183,138 @@ struct CoreTests {
         #expect(PlaintextCredentialStore.shared.fileURL.deletingLastPathComponent() == EchoStorage.directoryURL)
         #expect(PlaintextCredentialStore.shared.fileURL.lastPathComponent == "credentials.json")
     }
+
+    @Test("Floating bilingual rows grow for every wrapped English and Chinese line")
+    func floatingSubtitleRowHeightFitsBothLanguages() {
+        let segment = SubtitleSegment(
+            id: "wrapped",
+            start: 0,
+            end: 4,
+            original: "goal, aka you want the good grades, but you don't know where you're going to get the fried chicken, then you're just going to walk around aimlessly and",
+            translation: "目标，也就是你想要好成绩，但如果你不知道去哪里买炸鸡，那你就只会漫无目的地走来走去，"
+        )
+        let width: CGFloat = 380
+        let fontSize: CGFloat = 16.4553125
+        let englishOnly = FloatingSubtitleLayout.rowHeight(
+            for: segment,
+            mode: .original,
+            availableWidth: width,
+            fontSize: fontSize
+        )
+        let bilingual = FloatingSubtitleLayout.rowHeight(
+            for: segment,
+            mode: .bilingual,
+            availableWidth: width,
+            fontSize: fontSize
+        )
+        let highlightedEnglishHeight = ceil(NSAttributedString(
+            string: segment.original,
+            attributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: .semibold)]
+        ).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height)
+        let translatedHeight = ceil(NSAttributedString(
+            string: segment.translation ?? "",
+            attributes: [.font: NSFont.systemFont(ofSize: max(11, fontSize - 3))]
+        ).boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height)
+        let requiredHighlightedHeight = 16 + highlightedEnglishHeight + 5 + translatedHeight
+
+        #expect(bilingual > englishOnly + 20)
+        #expect(bilingual >= requiredHighlightedHeight)
+    }
+
+    @Test("Auto-follow positions the active subtitle near the top of the viewport")
+    func floatingSubtitleFollowPosition() {
+        let origin = SubtitleAutoFollow.scrollOrigin(
+            row: NSRect(x: 0, y: 900, width: 400, height: 100),
+            documentHeight: 2_000,
+            viewportHeight: 400
+        )
+        #expect(origin == 820)
+    }
+
+    @Test("Transparent subtitle scrolling invalidates old glyph pixels")
+    @MainActor
+    func transparentSubtitleScrollInvalidatesVisibleSurface() {
+        let scroll = TransparentSubtitleScrollView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        let document = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 2_000))
+        scroll.documentView = document
+
+        let before = scroll.transparentRedrawCount
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: 600))
+        scroll.reflectScrolledClipView(scroll.contentView)
+
+        #expect(scroll.transparentRedrawCount == before + 1)
+        #expect(scroll.lastInvalidatedDocumentRect.height > 0)
+        #expect(scroll.lastInvalidatedDocumentRect.intersects(scroll.documentVisibleRect))
+    }
+
+    @Test("Fully transparent floating subtitles do not use a glyph-shaped window shadow")
+    @MainActor
+    func floatingSubtitleWindowDisablesSystemShadow() {
+        let controller = FloatingSubtitleWindowController()
+        #expect(controller.window?.hasShadow == false)
+    }
+
+    @Test("Hidden videos stay persisted but disappear from the active playlist")
+    func hiddenVideoLibrarySemantics() {
+        let first = VideoItem(id: "first", url: "https://www.youtube.com/watch?v=first")
+        let second = VideoItem(id: "second", url: "https://www.youtube.com/watch?v=second")
+        let transcript = TranscriptDocument(videoID: "first", sourceLanguage: "en", isGenerated: false, segments: [])
+        var library = AppLibrary(videos: [first, second], transcripts: ["first": transcript])
+
+        library.hideVideo("first")
+        #expect(library.visibleVideos.map(\.id) == ["second"])
+        #expect(library.hiddenVideos.map(\.id) == ["first"])
+        #expect(library.transcripts["first"] != nil)
+
+        library.unhideVideo("first")
+        #expect(library.visibleVideos.map(\.id) == ["first", "second"])
+        #expect(library.hiddenVideos.isEmpty)
+    }
+
+    @Test("Deleting a video removes its metadata, subtitles, and background card")
+    func deletingVideoRemovesAllStoredData() {
+        let video = VideoItem(id: "delete-me", url: "https://www.youtube.com/watch?v=delete-me")
+        let transcript = TranscriptDocument(videoID: video.id, sourceLanguage: "en", isGenerated: false, segments: [])
+        let card = VideoBackgroundCard(
+            videoID: video.id,
+            overview: "overview",
+            chapters: [],
+            domain: "",
+            tone: "",
+            entities: [],
+            terminology: [],
+            uncertainties: [],
+            generatedAt: Date(),
+            editedAt: nil,
+            sourceSegmentCount: 0
+        )
+        var library = AppLibrary(videos: [video], transcripts: [video.id: transcript], backgroundCards: [video.id: card])
+
+        library.deleteVideo(video.id)
+
+        #expect(library.videos.isEmpty)
+        #expect(library.transcripts[video.id] == nil)
+        #expect(library.backgroundCards[video.id] == nil)
+        #expect(!library.hiddenVideoIDs.contains(video.id))
+    }
+
+    @Test("Playback queue supports list loop and single-video loop")
+    func playbackQueueLoopModes() {
+        let videos = [
+            VideoItem(id: "a", url: "https://www.youtube.com/watch?v=a"),
+            VideoItem(id: "b", url: "https://www.youtube.com/watch?v=b"),
+            VideoItem(id: "c", url: "https://www.youtube.com/watch?v=c"),
+        ]
+
+        #expect(PlaybackQueue.nextVideoID(after: "b", videos: videos, mode: .list) == "c")
+        #expect(PlaybackQueue.nextVideoID(after: "c", videos: videos, mode: .list) == "a")
+        #expect(PlaybackQueue.nextVideoID(after: "b", videos: videos, mode: .single) == "b")
+        #expect(PlaybackQueue.nextVideoID(after: "b", videos: videos, mode: .none) == nil)
+    }
 }

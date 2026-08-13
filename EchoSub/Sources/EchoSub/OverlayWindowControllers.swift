@@ -8,8 +8,10 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     private let pinButton = EchoStyle.iconButton("pin", help: "Pin 置顶", target: nil, action: nil)
     private let followButton = EchoStyle.iconButton("scope", help: "自动跟随", target: nil, action: nil)
     private let opacitySlider = NSSlider()
+    private weak var scrollView: NSScrollView?
     private var autoFollow = true
     private var currentRow = -1
+    private var isProgrammaticScroll = false
     private var observers: [NSObjectProtocol] = []
 
     init() {
@@ -23,6 +25,10 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         panel.titlebarAppearsTransparent = true
         panel.isOpaque = false
         panel.backgroundColor = .clear
+        // With a fully transparent background, the system window shadow is
+        // derived from subtitle glyphs and can retain stale glyph silhouettes
+        // as the table scrolls. The subtitle cells provide their own highlight.
+        panel.hasShadow = false
         panel.minSize = NSSize(width: 320, height: 200)
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
@@ -95,15 +101,17 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         retryLine.target = self
         contextMenu.addItem(retryLine)
         table.menu = contextMenu
-        let scroll = NSScrollView()
+        let scroll = TransparentSubtitleScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.contentView.postsBoundsChangedNotifications = true
+        scrollView = scroll
         observers.append(NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: scroll.contentView, queue: .main) { [weak self] _ in
-            guard let self, self.window?.firstResponder === self.table else { return }
+            guard let self, !self.isProgrammaticScroll, self.window?.firstResponder === self.table else { return }
             self.autoFollow = false
             self.refreshControls()
         })
@@ -138,17 +146,37 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
 
     private func reload() { currentRow = -1; table.reloadData(); updateCurrentRow() }
 
-    private func updateCurrentRow() {
+    private func updateCurrentRow(forceScroll: Bool = false) {
         guard let segments = state.currentTranscript?.segments else { return }
         let row = segments.lastIndex(where: { $0.start <= state.playbackTime }) ?? (segments.isEmpty ? -1 : 0)
-        guard row != currentRow else { return }
+        guard row != currentRow else {
+            if forceScroll, autoFollow, row >= 0 { scrollCurrentRowNearTop(row) }
+            return
+        }
         let old = currentRow
         currentRow = row
         var rows = IndexSet()
         if old >= 0 { rows.insert(old) }
         if row >= 0 { rows.insert(row) }
         table.reloadData(forRowIndexes: rows, columnIndexes: IndexSet(integer: 0))
-        if autoFollow, row >= 0 { table.scrollRowToVisible(row) }
+        if autoFollow, row >= 0 { scrollCurrentRowNearTop(row) }
+    }
+
+    private func scrollCurrentRowNearTop(_ row: Int) {
+        guard let scrollView else { return }
+        table.layoutSubtreeIfNeeded()
+        let rowRect = table.rect(ofRow: row)
+        guard !rowRect.isEmpty else { return }
+        let clipView = scrollView.contentView
+        let y = SubtitleAutoFollow.scrollOrigin(
+            row: rowRect,
+            documentHeight: table.bounds.height,
+            viewportHeight: clipView.bounds.height
+        )
+        isProgrammaticScroll = true
+        clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: y))
+        scrollView.reflectScrolledClipView(clipView)
+        DispatchQueue.main.async { [weak self] in self?.isProgrammaticScroll = false }
     }
 
     private func refreshControls() {
@@ -185,24 +213,12 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         guard let segment = state.currentTranscript?.segments[safeOverlay: row] else { return 58 }
         let mode = SubtitleDisplayMode(rawValue: modeControl.selectedSegment) ?? .bilingual
-        return measuredRowHeight(for: segment, mode: mode)
-    }
-
-    private func measuredRowHeight(for segment: SubtitleSegment, mode: SubtitleDisplayMode) -> CGFloat {
-        let width = max(160, table.bounds.width - 40)
-        let originalFont = NSFont.systemFont(ofSize: settings.overlayFontSize, weight: .regular)
-        let translatedFont = NSFont.systemFont(ofSize: max(11, settings.overlayFontSize - 3))
-        func textHeight(_ text: String, font: NSFont) -> CGFloat {
-            ceil(NSAttributedString(string: text, attributes: [.font: font]).boundingRect(
-                with: NSSize(width: width, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading]
-            ).height)
-        }
-        var result: CGFloat = 16
-        if mode != .translated { result += textHeight(segment.original, font: originalFont) }
-        if mode == .bilingual { result += 5 }
-        if mode != .original { result += textHeight(segment.translation ?? "等待翻译…", font: translatedFont) }
-        return max(54, result)
+        return FloatingSubtitleLayout.rowHeight(
+            for: segment,
+            mode: mode,
+            availableWidth: table.bounds.width - 28,
+            fontSize: CGFloat(settings.overlayFontSize)
+        )
     }
 
     private func refreshRowHeights() {
@@ -230,7 +246,7 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         setPinned(willPin)
         settings.floatPinned = willPin
     }
-    @objc private func toggleFollow() { autoFollow.toggle(); refreshControls(); if autoFollow { updateCurrentRow() } }
+    @objc private func toggleFollow() { autoFollow.toggle(); refreshControls(); if autoFollow { updateCurrentRow(forceScroll: true) } }
     @objc private func decreaseFont() { settings.overlayFontSize = max(12, settings.overlayFontSize - 2); refreshRowHeights() }
     @objc private func increaseFont() { settings.overlayFontSize = min(36, settings.overlayFontSize + 2); refreshRowHeights() }
     @objc private func modeChanged() { refreshRowHeights() }
@@ -254,7 +270,14 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         }
     }
 
-    func windowDidResize(_ notification: Notification) { refreshRowHeights() }
+    func windowDidResize(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.refreshRowHeights() }
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        refreshRowHeights()
+        if autoFollow { updateCurrentRow(forceScroll: true) }
+    }
 }
 
 private final class FloatingCell: NSTableCellView {
@@ -267,6 +290,7 @@ private final class FloatingCell: NSTableCellView {
         identifier = Self.identifier
         wantsLayer = true
         layer?.cornerRadius = 7
+        layer?.masksToBounds = true
         let stack = NSStackView(views: [original, translation])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -303,6 +327,31 @@ private final class FloatingCell: NSTableCellView {
             alpha: current ? 1 : 0.72
         )
         layer?.backgroundColor = current ? EchoStyle.highlight.cgColor : NSColor.clear.cgColor
+    }
+}
+
+/// AppKit minimizes invalidation while scrolling. That optimization leaves old
+/// glyph pixels in a fully transparent window because no opaque background is
+/// painted over them, so invalidate the complete transparent surface whenever
+/// its clip view moves.
+final class TransparentSubtitleScrollView: NSScrollView {
+    private(set) var transparentRedrawCount = 0
+    private(set) var lastInvalidatedDocumentRect = NSRect.zero
+
+    override func reflectScrolledClipView(_ clipView: NSClipView) {
+        super.reflectScrolledClipView(clipView)
+        invalidateTransparentSurface()
+    }
+
+    func invalidateTransparentSurface() {
+        transparentRedrawCount += 1
+        lastInvalidatedDocumentRect = documentVisibleRect
+        contentView.needsDisplay = true
+        documentView?.needsDisplay = true
+        documentView?.setNeedsDisplay(documentVisibleRect)
+        superview?.needsDisplay = true
+        window?.contentView?.needsDisplay = true
+        displayIfNeeded()
     }
 }
 

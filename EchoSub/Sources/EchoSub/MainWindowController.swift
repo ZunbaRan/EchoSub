@@ -23,13 +23,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     private let subtitleToggleButton = EchoStyle.iconButton("sidebar.right", help: "折叠字幕", target: nil, action: nil)
     private let nativeFullscreenButton = EchoStyle.iconButton("arrow.up.left.and.arrow.down.right", help: "播放器窗口全屏", target: nil, action: nil)
     private let playlistCountLabel = EchoStyle.label("0", size: 11, color: EchoStyle.textTertiary)
+    private let playlistTitleLabel = EchoStyle.label("播放列表", size: 12, weight: .semibold, color: EchoStyle.textSecondary)
+    private let hiddenPlaylistButton = EchoStyle.button("已隐藏", symbol: "archivebox", target: nil, action: nil)
     private let playButton = EchoStyle.iconButton("play.fill", help: "播放 / 暂停", target: nil, action: nil)
+    private let loopButton = EchoStyle.iconButton("repeat", help: "循环：关闭", target: nil, action: nil)
     private var splitView: NSSplitView!
     private var currentSubtitleRow = -1
     private var autoFollow = true
     private var isPlaying = false
+    private var showingHiddenVideos = false
     private var playlistCollapsed = false
     private var subtitleCollapsed = false
+    private var autoplayVideoID: String?
     private var lastPlaylistWidth: CGFloat = 236
     private var lastSubtitleWidth: CGFloat = 348
     private var isApplyingSplitLayout = false
@@ -174,8 +179,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         playlistContainer.layer?.backgroundColor = EchoStyle.sidebarBackground.cgColor
         playlistContainer.translatesAutoresizingMaskIntoConstraints = false
 
-        let headerTitle = EchoStyle.label("播放列表", size: 12, weight: .semibold, color: EchoStyle.textSecondary)
-        let header = NSStackView(views: [headerTitle, NSView(), playlistCountLabel])
+        hiddenPlaylistButton.target = self
+        hiddenPlaylistButton.action = #selector(toggleHiddenPlaylist)
+        hiddenPlaylistButton.isBordered = false
+        hiddenPlaylistButton.font = .systemFont(ofSize: 10.5, weight: .medium)
+        hiddenPlaylistButton.contentTintColor = EchoStyle.textSecondary
+        let header = NSStackView(views: [playlistTitleLabel, NSView(), hiddenPlaylistButton, playlistCountLabel])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.translatesAutoresizingMaskIntoConstraints = false
@@ -190,6 +199,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         playlistTable.intercellSpacing = NSSize(width: 0, height: 4)
         playlistTable.dataSource = self
         playlistTable.delegate = self
+        let playlistMenu = NSMenu(title: "视频操作")
+        playlistMenu.delegate = self
+        playlistMenu.addItem(withTitle: "视频操作", action: nil, keyEquivalent: "")
+        playlistTable.menu = playlistMenu
         let scroll = NSScrollView()
         scroll.documentView = playlistTable
         scroll.hasVerticalScroller = true
@@ -281,7 +294,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         nativeFullscreenButton.target = self
         nativeFullscreenButton.action = #selector(togglePlayerFullscreen)
         let external = EchoStyle.iconButton("arrow.up.right.square", help: "在 YouTube 打开", target: self, action: #selector(openYouTube))
-        let stack = NSStackView(views: [titles, NSView(), back, playButton, forward, floatButton, lyricButton, nativeFullscreenButton, external])
+        loopButton.target = self
+        loopButton.action = #selector(cycleLoopMode)
+        let stack = NSStackView(views: [titles, NSView(), back, playButton, forward, loopButton, floatButton, lyricButton, nativeFullscreenButton, external])
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 7
@@ -381,6 +396,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         ])
         backgroundCardPanel.pinEdges(to: subtitleContainer)
         refreshFollowButton()
+        refreshLoopButton()
         return subtitleContainer
     }
 
@@ -407,7 +423,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
 
     private func refreshLibrary() {
         playlistTable.reloadData()
-        playlistCountLabel.stringValue = "\(state.library.videos.count)"
+        let count = playlistVideos.count
+        playlistCountLabel.stringValue = "\(count)"
+        playlistTitleLabel.stringValue = showingHiddenVideos ? "已隐藏" : "播放列表"
+        hiddenPlaylistButton.title = showingHiddenVideos ? "返回" : "已隐藏 \(state.hiddenVideos.count)"
+        hiddenPlaylistButton.image = NSImage(systemSymbolName: showingHiddenVideos ? "chevron.left" : "archivebox", accessibilityDescription: nil)
+        hiddenPlaylistButton.isHidden = !showingHiddenVideos && state.hiddenVideos.isEmpty
+    }
+
+    private var playlistVideos: [VideoItem] {
+        showingHiddenVideos ? state.hiddenVideos : state.visibleVideos
     }
 
     private func refreshCurrentVideo() {
@@ -567,9 +592,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         followButton.toolTip = autoFollow ? "自动跟随中" : "恢复自动跟随"
     }
 
+    private func refreshLoopButton() {
+        switch settings.playbackLoopMode {
+        case .none:
+            loopButton.image = NSImage(systemSymbolName: "repeat", accessibilityDescription: nil)
+            loopButton.contentTintColor = EchoStyle.textSecondary
+            loopButton.toolTip = "循环：关闭（点击切换为列表循环）"
+        case .list:
+            loopButton.image = NSImage(systemSymbolName: "repeat", accessibilityDescription: nil)
+            loopButton.contentTintColor = EchoStyle.accent
+            loopButton.toolTip = "列表循环（点击切换为单首循环）"
+        case .single:
+            loopButton.image = NSImage(systemSymbolName: "repeat.1", accessibilityDescription: nil)
+            loopButton.contentTintColor = EchoStyle.accent
+            loopButton.toolTip = "单首循环（点击关闭循环）"
+        }
+    }
+
     private func refreshSubtitleAppearance() {
         invalidateSubtitleRowHeights()
         subtitleTable.reloadData()
+        refreshLoopButton()
     }
 
     private func invalidateSubtitleRowHeights() {
@@ -578,7 +621,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        tableView === playlistTable ? state.library.videos.count : (state.currentTranscript?.segments.count ?? 0)
+        tableView === playlistTable ? playlistVideos.count : (state.currentTranscript?.segments.count ?? 0)
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
@@ -601,7 +644,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         if tableView === playlistTable {
-            guard let video = state.library.videos[safe: row] else { return nil }
+            guard let video = playlistVideos[safe: row] else { return nil }
             let view = tableView.makeView(withIdentifier: PlaylistCell.identifier, owner: self) as? PlaylistCell ?? PlaylistCell()
             view.configure(video, current: video.id == state.currentVideoID)
             return view
@@ -615,7 +658,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard let table = notification.object as? NSTableView, table.selectedRow >= 0 else { return }
-        if table === playlistTable, let video = state.library.videos[safe: table.selectedRow] {
+        if table === playlistTable, let video = playlistVideos[safe: table.selectedRow] {
+            if showingHiddenVideos { return }
             state.selectVideo(video.id)
         } else if table === subtitleTable, let segment = state.currentTranscript?.segments[safe: table.selectedRow] {
             playerView.seek(to: segment.start)
@@ -653,6 +697,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         subtitleTable.reloadData()
     }
     @objc private func toggleFollow() { autoFollow.toggle(); refreshFollowButton(); if autoFollow { refreshPlaybackPosition() } }
+    @objc private func toggleHiddenPlaylist() {
+        showingHiddenVideos.toggle()
+        playlistTable.deselectAll(nil)
+        refreshLibrary()
+    }
+    @objc private func cycleLoopMode() {
+        switch settings.playbackLoopMode {
+        case .none: settings.playbackLoopMode = .list
+        case .list: settings.playbackLoopMode = .single
+        case .single: settings.playbackLoopMode = .none
+        }
+        refreshLoopButton()
+    }
     @objc private func togglePlaylist() {
         setPlaylistCollapsed(!playlistCollapsed)
     }
@@ -806,13 +863,57 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        guard menu === subtitleTable.menu, let item = menu.items.first else { return }
-        let row = subtitleTable.clickedRow
-        item.isEnabled = row >= 0
-        if row >= 0, let segment = state.currentTranscript?.segments[safe: row] {
-            item.title = segment.translation?.isEmpty == false ? "重新翻译此句" : "补翻此句"
-        } else {
-            item.title = "补翻 / 重试此句"
+        if menu === playlistTable.menu {
+            menu.removeAllItems()
+            let row = playlistTable.clickedRow
+            guard row >= 0, playlistVideos[safe: row] != nil else { return }
+            if showingHiddenVideos {
+                let restore = NSMenuItem(title: "恢复到播放列表", action: #selector(unhideClickedVideo), keyEquivalent: "")
+                restore.target = self
+                menu.addItem(restore)
+            } else {
+                let hide = NSMenuItem(title: "隐藏", action: #selector(hideClickedVideo), keyEquivalent: "")
+                hide.target = self
+                menu.addItem(hide)
+            }
+            menu.addItem(.separator())
+            let delete = NSMenuItem(title: "删除…", action: #selector(confirmDeleteClickedVideo), keyEquivalent: "")
+            delete.target = self
+            menu.addItem(delete)
+            return
+        }
+        if menu === subtitleTable.menu, let item = menu.items.first {
+            let row = subtitleTable.clickedRow
+            item.isEnabled = row >= 0
+            if row >= 0, let segment = state.currentTranscript?.segments[safe: row] {
+                item.title = segment.translation?.isEmpty == false ? "重新翻译此句" : "补翻此句"
+            } else {
+                item.title = "补翻 / 重试此句"
+            }
+        }
+    }
+    @objc private func hideClickedVideo() {
+        let row = playlistTable.clickedRow
+        guard let video = playlistVideos[safe: row] else { return }
+        state.hideVideo(video.id)
+    }
+    @objc private func unhideClickedVideo() {
+        let row = playlistTable.clickedRow
+        guard let video = playlistVideos[safe: row] else { return }
+        state.unhideVideo(video.id)
+    }
+    @objc private func confirmDeleteClickedVideo() {
+        let row = playlistTable.clickedRow
+        guard let video = playlistVideos[safe: row], let window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "删除“\(video.title)”？"
+        alert.informativeText = "将永久删除视频信息、原字幕、翻译结果和视频背景卡。此操作无法撤销。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.state.removeVideo(video.id)
         }
     }
     @objc private func openSettings() { NotificationCenter.default.post(name: .echoOpenSettings, object: nil) }
@@ -849,9 +950,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     }
 
     func playerView(_ view: YouTubePlayerView, didUpdateTime time: Double) { state.updatePlaybackTime(time) }
+    func playerViewDidBecomeReady(_ view: YouTubePlayerView) {
+        guard autoplayVideoID == view.videoID else { return }
+        autoplayVideoID = nil
+        view.play()
+    }
     func playerView(_ view: YouTubePlayerView, didChangeState playerState: Int) {
         isPlaying = playerState == 1
         playButton.image = NSImage(systemSymbolName: isPlaying ? "pause.fill" : "play.fill", accessibilityDescription: nil)
+        guard playerState == 0, let currentID = state.currentVideoID else { return }
+        let visibleVideos = state.visibleVideos
+        guard let nextID = PlaybackQueue.nextVideoID(
+            after: currentID,
+            videos: visibleVideos,
+            mode: settings.playbackLoopMode
+        ) else { return }
+        if nextID == currentID {
+            state.updatePlaybackTime(0)
+            playerView.seek(to: 0)
+            playerView.play()
+        } else {
+            autoplayVideoID = nextID
+            state.playVideoFromBeginning(nextID)
+        }
     }
     func playerView(_ view: YouTubePlayerView, didFailWithCode code: Int) {
         if code == 101 || code == 150 || code == 152 || code == 153 {
