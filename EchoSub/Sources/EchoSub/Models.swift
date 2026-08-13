@@ -6,6 +6,12 @@ enum SubtitleDisplayMode: Int, Codable, CaseIterable {
     case bilingual
 }
 
+enum PlaybackLoopMode: Int, Codable, CaseIterable {
+    case none
+    case list
+    case single
+}
+
 enum TranscriptStatus: String, Codable {
     case idle
     case loading
@@ -185,19 +191,25 @@ struct AppLibrary: Codable {
     var videos: [VideoItem] = []
     var transcripts: [String: TranscriptDocument] = [:]
     var backgroundCards: [String: VideoBackgroundCard] = [:]
+    var hiddenVideoIDs: Set<String> = []
+
+    var visibleVideos: [VideoItem] { videos.filter { !hiddenVideoIDs.contains($0.id) } }
+    var hiddenVideos: [VideoItem] { videos.filter { hiddenVideoIDs.contains($0.id) } }
 
     init(
         videos: [VideoItem] = [],
         transcripts: [String: TranscriptDocument] = [:],
-        backgroundCards: [String: VideoBackgroundCard] = [:]
+        backgroundCards: [String: VideoBackgroundCard] = [:],
+        hiddenVideoIDs: Set<String> = []
     ) {
         self.videos = videos
         self.transcripts = transcripts
         self.backgroundCards = backgroundCards
+        self.hiddenVideoIDs = hiddenVideoIDs
     }
 
     private enum CodingKeys: String, CodingKey {
-        case videos, transcripts, backgroundCards
+        case videos, transcripts, backgroundCards, hiddenVideoIDs
     }
 
     init(from decoder: Decoder) throws {
@@ -205,8 +217,78 @@ struct AppLibrary: Codable {
         videos = try container.decodeIfPresent([VideoItem].self, forKey: .videos) ?? []
         transcripts = try container.decodeIfPresent([String: TranscriptDocument].self, forKey: .transcripts) ?? [:]
         backgroundCards = try container.decodeIfPresent([String: VideoBackgroundCard].self, forKey: .backgroundCards) ?? [:]
+        hiddenVideoIDs = try container.decodeIfPresent(Set<String>.self, forKey: .hiddenVideoIDs) ?? []
+        hiddenVideoIDs.formIntersection(Set(videos.map(\.id)))
+    }
+
+    mutating func hideVideo(_ videoID: String) {
+        guard videos.contains(where: { $0.id == videoID }) else { return }
+        hiddenVideoIDs.insert(videoID)
+    }
+
+    mutating func unhideVideo(_ videoID: String) {
+        hiddenVideoIDs.remove(videoID)
+    }
+
+    mutating func deleteVideo(_ videoID: String) {
+        videos.removeAll { $0.id == videoID }
+        transcripts[videoID] = nil
+        backgroundCards[videoID] = nil
+        hiddenVideoIDs.remove(videoID)
     }
 }
+
+enum PlaybackQueue {
+    static func nextVideoID(after currentVideoID: String, videos: [VideoItem], mode: PlaybackLoopMode) -> String? {
+        switch mode {
+        case .none:
+            return nil
+        case .single:
+            return videos.contains(where: { $0.id == currentVideoID }) ? currentVideoID : nil
+        case .list:
+            guard !videos.isEmpty,
+                  let index = videos.firstIndex(where: { $0.id == currentVideoID }) else { return videos.first?.id }
+            return videos[(index + 1) % videos.count].id
+        }
+    }
+}
+
+#if canImport(AppKit)
+import AppKit
+
+enum FloatingSubtitleLayout {
+    static func rowHeight(
+        for segment: SubtitleSegment,
+        mode: SubtitleDisplayMode,
+        availableWidth: CGFloat,
+        fontSize: CGFloat
+    ) -> CGFloat {
+        let width = max(100, availableWidth)
+        // Every row reserves space for the highlighted rendering. The active
+        // subtitle uses semibold, which can wrap one line earlier than regular.
+        let originalFont = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+        let translatedFont = NSFont.systemFont(ofSize: max(11, fontSize - 3))
+        func textHeight(_ text: String, font: NSFont) -> CGFloat {
+            ceil(NSAttributedString(string: text, attributes: [.font: font]).boundingRect(
+                with: NSSize(width: width, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            ).height)
+        }
+        var height: CGFloat = 16
+        if mode != .translated { height += textHeight(segment.original, font: originalFont) }
+        if mode == .bilingual { height += 5 }
+        if mode != .original { height += textHeight(segment.translation ?? "等待翻译…", font: translatedFont) }
+        return max(54, height)
+    }
+}
+
+enum SubtitleAutoFollow {
+    static func scrollOrigin(row: NSRect, documentHeight: CGFloat, viewportHeight: CGFloat) -> CGFloat {
+        let preferredTopPadding = min(80, viewportHeight * 0.2)
+        return min(max(0, row.minY - preferredTopPadding), max(0, documentHeight - viewportHeight))
+    }
+}
+#endif
 
 struct TranslationConfiguration: Equatable {
     var baseURL: String

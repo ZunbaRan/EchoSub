@@ -17,13 +17,16 @@ final class AppState {
 
     private init() {
         library = store.load()
-        currentVideoID = library.videos.first?.id
+        currentVideoID = library.visibleVideos.first?.id
     }
 
     var currentVideo: VideoItem? {
         guard let currentVideoID else { return nil }
         return library.videos.first { $0.id == currentVideoID }
     }
+
+    var visibleVideos: [VideoItem] { library.visibleVideos }
+    var hiddenVideos: [VideoItem] { library.hiddenVideos }
 
     var currentTranscript: TranscriptDocument? {
         guard let currentVideoID else { return nil }
@@ -56,6 +59,11 @@ final class AppState {
             return .failure(NSError(domain: "EchoSub", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法识别这个 YouTube 链接。"] ))
         }
         if let existing = library.videos.first(where: { $0.id == videoID }) {
+            if library.hiddenVideoIDs.contains(videoID) {
+                library.unhideVideo(videoID)
+                persist()
+                NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
+            }
             selectVideo(videoID)
             return .success(existing)
         }
@@ -82,21 +90,45 @@ final class AppState {
         if library.transcripts[videoID] == nil { fetchTranscript(for: videoID) }
     }
 
+    func playVideoFromBeginning(_ videoID: String) {
+        guard let index = library.videos.firstIndex(where: { $0.id == videoID }) else { return }
+        library.videos[index].progress = 0
+        persist()
+        selectVideo(videoID)
+    }
+
     func removeVideo(_ videoID: String) {
-        library.videos.removeAll { $0.id == videoID }
-        library.transcripts[videoID] = nil
-        library.backgroundCards[videoID] = nil
+        if currentVideoID == videoID { translationJobID = nil }
+        library.deleteVideo(videoID)
         backgroundCardJobs[videoID] = nil
         backgroundCardErrors[videoID] = nil
         backgroundCardCompletions[videoID] = nil
         if currentVideoID == videoID {
-            currentVideoID = library.videos.first?.id
+            currentVideoID = library.visibleVideos.first?.id
             playbackTime = currentVideo?.progress ?? 0
             NotificationCenter.default.post(name: .echoCurrentVideoChanged, object: nil)
         }
         persist()
         NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
         NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
+    }
+
+    func hideVideo(_ videoID: String) {
+        library.hideVideo(videoID)
+        if currentVideoID == videoID {
+            currentVideoID = library.visibleVideos.first?.id
+            playbackTime = currentVideo?.progress ?? 0
+            NotificationCenter.default.post(name: .echoCurrentVideoChanged, object: nil)
+            NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
+        }
+        persist()
+        NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
+    }
+
+    func unhideVideo(_ videoID: String) {
+        library.unhideVideo(videoID)
+        persist()
+        NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
     }
 
     func updatePlaybackTime(_ time: Double) {
