@@ -221,6 +221,24 @@ struct AppLibrary: Codable {
         hiddenVideoIDs.formIntersection(Set(videos.map(\.id)))
     }
 
+    @discardableResult
+    mutating func recoverInterruptedOperations() -> [String] {
+        var recovered: [String] = []
+        for index in videos.indices where videos[index].status == .translating {
+            recovered.append(videos[index].id)
+            recoverInterruptedTranslation(for: videos[index].id)
+        }
+        return recovered
+    }
+
+    @discardableResult
+    mutating func recoverInterruptedTranslation(for videoID: String) -> Bool {
+        guard let index = videos.firstIndex(where: { $0.id == videoID }),
+              videos[index].status == .translating else { return false }
+        videos[index].status = transcripts[videoID] == nil ? .idle : .ready
+        return true
+    }
+
     mutating func hideVideo(_ videoID: String) {
         guard videos.contains(where: { $0.id == videoID }) else { return }
         hiddenVideoIDs.insert(videoID)
@@ -294,6 +312,39 @@ struct TranslationConfiguration: Equatable {
     var baseURL: String
     var model: String
     var apiKey: String
+}
+
+struct TranslationJobRegistry {
+    private var jobsByVideoID: [String: UUID] = [:]
+
+    mutating func start(videoID: String, jobID: UUID) {
+        jobsByVideoID[videoID] = jobID
+    }
+
+    func matches(videoID: String, jobID: UUID) -> Bool {
+        jobsByVideoID[videoID] == jobID
+    }
+
+    func isRunning(videoID: String) -> Bool {
+        jobsByVideoID[videoID] != nil
+    }
+
+    func jobID(for videoID: String) -> UUID? {
+        jobsByVideoID[videoID]
+    }
+
+    mutating func finish(videoID: String, jobID: UUID) {
+        guard matches(videoID: videoID, jobID: jobID) else { return }
+        jobsByVideoID[videoID] = nil
+    }
+
+    mutating func cancel(videoID: String) {
+        jobsByVideoID[videoID] = nil
+    }
+
+    mutating func cancelAll() {
+        jobsByVideoID.removeAll()
+    }
 }
 
 enum TranslationScope: Equatable {

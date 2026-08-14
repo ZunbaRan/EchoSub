@@ -50,6 +50,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "关于 EchoSub", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
+        let diagnostics = NSMenuItem(title: "打开诊断日志", action: #selector(openDiagnosticLog), keyEquivalent: "")
+        diagnostics.target = self
+        appMenu.addItem(diagnostics)
+        let revealData = NSMenuItem(title: "显示本地数据文件夹", action: #selector(revealLocalData), keyEquivalent: "")
+        revealData.target = self
+        appMenu.addItem(revealData)
+        appMenu.addItem(NSMenuItem.separator())
         let preferences = NSMenuItem(title: "设置…", action: #selector(showSettingsMenu), keyEquivalent: ",")
         preferences.target = self
         appMenu.addItem(preferences)
@@ -131,6 +138,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showSettingsMenu() { showSettings() }
+    @objc private func openDiagnosticLog() {
+        DiagnosticLogger.shared.record("diagnostics.opened_by_user")
+        NSWorkspace.shared.open(DiagnosticLogger.shared.fileURL)
+    }
+    @objc private func revealLocalData() {
+        NSWorkspace.shared.activateFileViewerSelecting([DiagnosticLogger.shared.fileURL])
+    }
     @objc private func toggleFloatingMenu() { toggleFloatingWindow() }
     @objc private func toggleLyricsMenu() { toggleLyricsWindow() }
     @objc private func toggleLyricsLock() {

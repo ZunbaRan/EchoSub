@@ -6,18 +6,31 @@ final class AppState {
     private let store = LibraryStore()
     private let transcriptService = YouTubeTranscriptService()
     private let translationService = TranslationService()
+    private let diagnostics = DiagnosticLogger.shared
     private(set) var library: AppLibrary
     private(set) var currentVideoID: String?
     private(set) var playbackTime: Double = 0
     private(set) var lastErrorMessage: String?
-    private var translationJobID: UUID?
+    private var translationJobs = TranslationJobRegistry()
     private var backgroundCardJobs: [String: UUID] = [:]
     private var backgroundCardErrors: [String: String] = [:]
     private var backgroundCardCompletions: [String: [(VideoBackgroundCard?) -> Void]] = [:]
 
     private init() {
         library = store.load()
+        let interruptedVideoIDs = library.recoverInterruptedOperations()
+        if !interruptedVideoIDs.isEmpty {
+            store.save(library)
+            diagnostics.record("translation.jobs.recovered_after_restart", fields: [
+                "video_ids": interruptedVideoIDs.joined(separator: ","),
+                "count": String(interruptedVideoIDs.count),
+            ])
+        }
         currentVideoID = library.visibleVideos.first?.id
+        diagnostics.record("app.started", fields: [
+            "videos": String(library.videos.count),
+            "recovered_jobs": String(interruptedVideoIDs.count),
+        ])
     }
 
     var currentVideo: VideoItem? {
@@ -98,7 +111,7 @@ final class AppState {
     }
 
     func removeVideo(_ videoID: String) {
-        if currentVideoID == videoID { translationJobID = nil }
+        translationJobs.cancel(videoID: videoID)
         library.deleteVideo(videoID)
         backgroundCardJobs[videoID] = nil
         backgroundCardErrors[videoID] = nil
@@ -153,15 +166,25 @@ final class AppState {
         return TranslationWorkPlan.segments(from: document, scope: .missing).count
     }
 
-    func translateMissing() { startTranslation(scope: .missing) }
+    func translateMissing() {
+        guard let currentVideoID else { return }
+        startTranslation(videoID: currentVideoID, scope: .missing)
+    }
 
-    func retranslateAll() { startTranslation(scope: .all, clearExisting: true) }
+    func retranslateAll() {
+        guard let currentVideoID else { return }
+        startTranslation(videoID: currentVideoID, scope: .all, clearExisting: true)
+    }
 
-    func translateSegment(id: String) { startTranslation(scope: .segment(id)) }
+    func translateSegment(id: String) {
+        guard let currentVideoID else { return }
+        startTranslation(videoID: currentVideoID, scope: .segment(id))
+    }
 
     func regenerateBackgroundCard(preservingUserTerms: Bool = false) {
+        guard let videoID = currentVideoID else { return }
         let previous = currentBackgroundCard
-        requestBackgroundCard(force: true) { [weak self] generated in
+        requestBackgroundCard(videoID: videoID, force: true) { [weak self] generated in
             guard preservingUserTerms,
                   let self,
                   let previous,
@@ -184,11 +207,13 @@ final class AppState {
     }
 
     private func startTranslation(
+        videoID: String,
         scope: TranslationScope,
         clearExisting: Bool = false,
         backgroundAttempted: Bool = false
     ) {
-        guard let video = currentVideo, var document = currentTranscript else { return }
+        guard let video = library.videos.first(where: { $0.id == videoID }),
+              var document = library.transcripts[videoID] else { return }
         let work = TranslationWorkPlan.segments(from: document, scope: scope)
         guard !work.isEmpty else { return }
         let config = AppSettings.shared.translationConfiguration
@@ -198,8 +223,8 @@ final class AppState {
             return
         }
         if library.backgroundCards[video.id] == nil, !backgroundAttempted {
-            requestBackgroundCard(force: false) { [weak self] _ in
-                self?.startTranslation(scope: scope, clearExisting: clearExisting, backgroundAttempted: true)
+            requestBackgroundCard(videoID: video.id, force: false) { [weak self] _ in
+                self?.startTranslation(videoID: video.id, scope: scope, clearExisting: clearExisting, backgroundAttempted: true)
             }
             return
         }
@@ -210,8 +235,28 @@ final class AppState {
             NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
         }
         let jobID = UUID()
-        translationJobID = jobID
+        if let previousJobID = translationJobs.jobID(for: video.id) {
+            diagnostics.record("translation.job.replaced_for_same_video", fields: [
+                "previous_job_id": previousJobID.uuidString,
+                "new_job_id": jobID.uuidString,
+                "video_id": video.id,
+            ])
+        }
+        translationJobs.start(videoID: video.id, jobID: jobID)
         lastErrorMessage = nil
+        diagnostics.record("translation.job.started", fields: [
+            "job_id": jobID.uuidString,
+            "video_id": video.id,
+            "scope": String(describing: scope),
+            "work_count": String(work.count),
+            "total_segments": String(document.segments.count),
+            "already_translated": String(document.segments.count - TranslationWorkPlan.segments(from: document, scope: .missing).count),
+            "model": config.model,
+            "endpoint_host": URL(string: config.baseURL)?.host ?? "invalid",
+            "thinking_mode": TranslationRequestPolicy.thinkingMode(model: config.model, purpose: .translation).map(String.init) ?? "provider_default",
+            "batch_size": String(TranslationRequestPolicy.batchSize),
+            "timeout_seconds": String(Int(TranslationRequestPolicy.translationTimeout)),
+        ])
         updateStatus(video.id, .translating)
         translateQueue(work, video: video, configuration: config, jobID: jobID, failedIDs: [])
     }
@@ -222,6 +267,7 @@ final class AppState {
         backgroundCardJobs.removeAll()
         backgroundCardErrors.removeAll()
         backgroundCardCompletions.removeAll()
+        translationJobs.cancelAll()
         for index in library.videos.indices { library.videos[index].status = .idle }
         persist()
         NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
@@ -233,6 +279,7 @@ final class AppState {
         backgroundCardJobs.removeAll()
         backgroundCardErrors.removeAll()
         backgroundCardCompletions.removeAll()
+        translationJobs.cancelAll()
         currentVideoID = nil
         playbackTime = 0
         persist()
@@ -289,9 +336,12 @@ final class AppState {
         jobID: UUID,
         failedIDs: Set<String>
     ) {
-        guard translationJobID == jobID else { return }
+        guard translationJobs.matches(videoID: video.id, jobID: jobID) else {
+            diagnostics.record("translation.job.stale_queue_ignored", fields: ["job_id": jobID.uuidString, "video_id": video.id])
+            return
+        }
         guard !remaining.isEmpty else {
-            translationJobID = nil
+            translationJobs.finish(videoID: video.id, jobID: jobID)
             let missing = library.transcripts[video.id].map { TranslationWorkPlan.segments(from: $0, scope: .missing).count } ?? 0
             if missing > 0 || !failedIDs.isEmpty {
                 lastErrorMessage = "仍有 \(missing) 句未翻译，可用“补全翻译”或右键单句重试。"
@@ -299,10 +349,24 @@ final class AppState {
                 lastErrorMessage = nil
             }
             updateStatus(video.id, .ready)
+            diagnostics.record("translation.job.finished", fields: [
+                "job_id": jobID.uuidString,
+                "video_id": video.id,
+                "missing_count": String(missing),
+                "failed_count": String(failedIDs.count),
+            ])
             return
         }
-        let batch = Array(remaining.prefix(24))
+        let batch = Array(remaining.prefix(TranslationRequestPolicy.batchSize))
         let tail = Array(remaining.dropFirst(batch.count))
+        diagnostics.record("translation.batch.queued", fields: [
+            "job_id": jobID.uuidString,
+            "video_id": video.id,
+            "batch_count": String(batch.count),
+            "remaining_after_batch": String(tail.count),
+            "first_cue_id": batch.first?.id ?? "",
+            "last_cue_id": batch.last?.id ?? "",
+        ])
         translateBatch(batch, tail: tail, attempt: 0, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs)
     }
 
@@ -315,10 +379,28 @@ final class AppState {
         jobID: UUID,
         failedIDs: Set<String>
     ) {
-        guard translationJobID == jobID else { return }
-        guard let document = library.transcripts[video.id] else { return }
+        guard translationJobs.matches(videoID: video.id, jobID: jobID) else {
+            diagnostics.record("translation.batch.stale_before_request", fields: ["job_id": jobID.uuidString, "video_id": video.id])
+            return
+        }
+        guard let document = library.transcripts[video.id] else {
+            diagnostics.record("translation.batch.transcript_missing", fields: ["job_id": jobID.uuidString, "video_id": video.id])
+            return
+        }
         let context = TranslationWorkPlan.context(around: batch, in: document, radius: 4)
         let backgroundCard = library.backgroundCards[video.id]
+        let requestID = UUID()
+        let startedAt = Date()
+        diagnostics.record("translation.request.started", fields: [
+            "job_id": jobID.uuidString,
+            "request_id": requestID.uuidString,
+            "video_id": video.id,
+            "attempt": String(attempt + 1),
+            "target_count": String(batch.count),
+            "context_count": String(context.count),
+            "first_cue_id": batch.first?.id ?? "",
+            "last_cue_id": batch.last?.id ?? "",
+        ])
         translationService.translate(
             segments: batch,
             context: context,
@@ -327,16 +409,63 @@ final class AppState {
             configuration: configuration
         ) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.translationJobID == jobID else { return }
+                guard let self else { return }
+                let elapsedMS = Int(Date().timeIntervalSince(startedAt) * 1_000)
+                guard self.translationJobs.matches(videoID: video.id, jobID: jobID) else {
+                    self.diagnostics.record("translation.request.stale_response_ignored", fields: [
+                        "job_id": jobID.uuidString,
+                        "request_id": requestID.uuidString,
+                        "video_id": video.id,
+                        "elapsed_ms": String(elapsedMS),
+                    ])
+                    return
+                }
                 switch result {
                 case .failure(let error):
-                    if attempt < 2 {
-                        self.translateBatch(batch, tail: tail, attempt: attempt + 1, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs)
+                    self.diagnostics.record("translation.request.failed", fields: [
+                        "job_id": jobID.uuidString,
+                        "request_id": requestID.uuidString,
+                        "video_id": video.id,
+                        "attempt": String(attempt + 1),
+                        "elapsed_ms": String(elapsedMS),
+                        "error_type": String(reflecting: type(of: error)),
+                        "error": error.localizedDescription,
+                    ])
+                    let failedAttempt = attempt + 1
+                    if let delay = TranslationRetryPolicy.delay(afterFailedAttempt: failedAttempt, error: error) {
+                        self.diagnostics.record("translation.request.retry_scheduled", fields: [
+                            "job_id": jobID.uuidString,
+                            "request_id": requestID.uuidString,
+                            "video_id": video.id,
+                            "failed_attempt": String(failedAttempt),
+                            "delay_seconds": String(format: "%.1f", delay),
+                        ])
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                            guard let self,
+                                  self.translationJobs.matches(videoID: video.id, jobID: jobID) else { return }
+                            self.translateBatch(batch, tail: tail, attempt: attempt + 1, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs)
+                        }
                     } else {
-                        self.lastErrorMessage = error.localizedDescription
+                        if self.currentVideoID == video.id { self.lastErrorMessage = error.localizedDescription }
+                        self.diagnostics.record("translation.batch.skipped_after_retries", fields: [
+                            "job_id": jobID.uuidString,
+                            "video_id": video.id,
+                            "attempts": String(failedAttempt),
+                            "skipped_count": String(batch.count),
+                            "skipped_ids": batch.map(\.id).joined(separator: ","),
+                        ])
                         self.translateQueue(tail, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs.union(batch.map(\.id)))
                     }
                 case .success(let translations):
+                    self.diagnostics.record("translation.request.succeeded", fields: [
+                        "job_id": jobID.uuidString,
+                        "request_id": requestID.uuidString,
+                        "video_id": video.id,
+                        "attempt": String(attempt + 1),
+                        "elapsed_ms": String(elapsedMS),
+                        "requested_count": String(batch.count),
+                        "translated_count": String(translations.count),
+                    ])
                     guard var document = self.library.transcripts[video.id] else { return }
                     for index in document.segments.indices {
                         if let translated = translations[document.segments[index].id] {
@@ -347,8 +476,29 @@ final class AppState {
                     self.persist()
                     NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
                     let unresolved = TranslationWorkPlan.unresolved(in: batch, translations: translations)
-                    if !unresolved.isEmpty, attempt < 2 {
-                        self.translateBatch(unresolved, tail: tail, attempt: attempt + 1, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs)
+                    if !unresolved.isEmpty {
+                        self.diagnostics.record("translation.batch.partial_response", fields: [
+                            "job_id": jobID.uuidString,
+                            "request_id": requestID.uuidString,
+                            "video_id": video.id,
+                            "unresolved_count": String(unresolved.count),
+                            "unresolved_ids": unresolved.map(\.id).joined(separator: ","),
+                        ])
+                    }
+                    if !unresolved.isEmpty,
+                       let delay = TranslationRetryPolicy.delay(afterFailedAttempt: attempt + 1, error: TranslationError.malformedResponse) {
+                        self.diagnostics.record("translation.partial_response.retry_scheduled", fields: [
+                            "job_id": jobID.uuidString,
+                            "video_id": video.id,
+                            "failed_attempt": String(attempt + 1),
+                            "delay_seconds": String(format: "%.1f", delay),
+                            "unresolved_count": String(unresolved.count),
+                        ])
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                            guard let self,
+                                  self.translationJobs.matches(videoID: video.id, jobID: jobID) else { return }
+                            self.translateBatch(unresolved, tail: tail, attempt: attempt + 1, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs)
+                        }
                     } else {
                         self.translateQueue(tail, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs.union(unresolved.map(\.id)))
                     }
@@ -367,10 +517,12 @@ final class AppState {
     }
 
     private func requestBackgroundCard(
+        videoID: String,
         force: Bool,
         completion: ((VideoBackgroundCard?) -> Void)?
     ) {
-        guard let video = currentVideo, let document = currentTranscript else {
+        guard let video = library.videos.first(where: { $0.id == videoID }),
+              let document = library.transcripts[videoID] else {
             completion?(nil)
             return
         }

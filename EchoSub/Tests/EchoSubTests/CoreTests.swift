@@ -36,6 +36,69 @@ struct CoreTests {
         #expect(TranslationWorkPlan.segments(from: document, scope: .all).count == 100)
     }
 
+    @Test("Interrupted translation status is recovered after an app restart")
+    func recoversInterruptedTranslationStatus() {
+        var interrupted = VideoItem(id: "interrupted", url: "https://www.youtube.com/watch?v=interrupted")
+        interrupted.status = .translating
+        let transcript = TranscriptDocument(
+            videoID: interrupted.id,
+            sourceLanguage: "en",
+            isGenerated: false,
+            segments: [SubtitleSegment(id: "s0", start: 0, end: 1, original: "Hello", translation: nil)]
+        )
+        var library = AppLibrary(videos: [interrupted], transcripts: [interrupted.id: transcript])
+
+        let recovered = library.recoverInterruptedOperations()
+
+        #expect(recovered == [interrupted.id])
+        #expect(library.videos.first?.status == .ready)
+    }
+
+    @Test("Different videos keep independent translation jobs")
+    func parallelVideoTranslationJobs() {
+        var jobs = TranslationJobRegistry()
+        let firstJob = UUID()
+        let secondJob = UUID()
+
+        jobs.start(videoID: "first", jobID: firstJob)
+        jobs.start(videoID: "second", jobID: secondJob)
+
+        #expect(jobs.matches(videoID: "first", jobID: firstJob))
+        #expect(jobs.matches(videoID: "second", jobID: secondJob))
+        jobs.finish(videoID: "first", jobID: firstJob)
+        #expect(!jobs.isRunning(videoID: "first"))
+        #expect(jobs.matches(videoID: "second", jobID: secondJob))
+    }
+
+    @Test("Rate-limited batches retry three total attempts then move on")
+    func translationRetryPolicy() {
+        let rateLimit = TranslationError.requestFailed(
+            statusCode: 429,
+            message: "rate limited",
+            retryAfter: 7
+        )
+
+        #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 1, error: rateLimit) == 7)
+        #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 2, error: rateLimit) == 15)
+        #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 3, error: rateLimit) == nil)
+    }
+
+    @Test("Routine translation disables thinking while background analysis keeps it")
+    func translationThinkingPolicy() {
+        #expect(TranslationRequestPolicy.thinkingMode(model: "qwen3.7-flash", purpose: .translation) == false)
+        #expect(TranslationRequestPolicy.thinkingMode(model: "qwen3.7-flash", purpose: .backgroundCard) == true)
+        #expect(TranslationRequestPolicy.thinkingMode(model: "deepseek-v4-flash", purpose: .translation) == false)
+        #expect(TranslationRequestPolicy.thinkingMode(model: "gpt-4o-mini", purpose: .translation) == nil)
+    }
+
+    @Test("Long subtitle jobs use smaller batches and a realistic request timeout")
+    func longVideoTranslationPolicy() {
+        #expect(TranslationRequestPolicy.batchSize == 12)
+        #expect(TranslationRequestPolicy.translationTimeout == 120)
+        #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 1, error: TranslationError.malformedResponse) == 5)
+        #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 2, error: TranslationError.malformedResponse) == 15)
+    }
+
     @Test("Retries model responses that omit individual subtitle IDs")
     func identifiesPartiallyTranslatedBatch() {
         let batch = (0..<4).map {
@@ -182,6 +245,27 @@ struct CoreTests {
     func credentialStorageLocation() {
         #expect(PlaintextCredentialStore.shared.fileURL.deletingLastPathComponent() == EchoStorage.directoryURL)
         #expect(PlaintextCredentialStore.shared.fileURL.lastPathComponent == "credentials.json")
+    }
+
+    @Test("Diagnostic logs are stored locally and redact credentials")
+    func diagnosticLogRedaction() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EchoSubDiagnosticTests-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = directory.appendingPathComponent("diagnostics.jsonl")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let logger = DiagnosticLogger(fileURL: fileURL)
+
+        logger.record("translation.request.started", fields: [
+            "model": "qwen3.7-flash",
+            "api_key": "never-write-this-secret",
+            "header": "Bearer another-secret",
+        ])
+
+        let log = try String(contentsOf: fileURL, encoding: .utf8)
+        #expect(log.contains("translation.request.started"))
+        #expect(log.contains("qwen3.7-flash"))
+        #expect(!log.contains("never-write-this-secret"))
+        #expect(!log.contains("another-secret"))
     }
 
     @Test("Floating bilingual rows grow for every wrapped English and Chinese line")

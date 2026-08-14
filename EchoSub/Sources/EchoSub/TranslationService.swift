@@ -3,15 +3,63 @@ import Foundation
 enum TranslationError: LocalizedError {
     case notConfigured
     case invalidEndpoint
-    case requestFailed(String)
+    case requestFailed(statusCode: Int, message: String, retryAfter: TimeInterval?)
     case malformedResponse
 
     var errorDescription: String? {
         switch self {
         case .notConfigured: return "请先在设置中配置翻译 API Key。"
         case .invalidEndpoint: return "翻译服务地址无效。"
-        case .requestFailed(let message): return message
+        case .requestFailed(_, let message, _): return message
         case .malformedResponse: return "翻译服务返回了无法识别的结果。"
+        }
+    }
+}
+
+enum TranslationRetryPolicy {
+    static let maximumAttempts = 3
+
+    static func delay(afterFailedAttempt attempt: Int, error: Error) -> TimeInterval? {
+        guard attempt < maximumAttempts else { return nil }
+        let fallback: TimeInterval = attempt == 1 ? 5 : 15
+        if case TranslationError.requestFailed(_, _, let retryAfter) = error, let retryAfter {
+            return max(fallback, retryAfter)
+        }
+        return fallback
+    }
+}
+
+enum TranslationRequestPurpose {
+    case translation
+    case backgroundCard
+}
+
+enum TranslationRequestPolicy {
+    static let batchSize = 12
+    static let translationTimeout: TimeInterval = 120
+    static let backgroundCardTimeout: TimeInterval = 180
+
+    static func thinkingMode(model: String, purpose: TranslationRequestPurpose) -> Bool? {
+        let normalized = model.lowercased()
+        let supportsExplicitThinking = normalized.contains("qwen3") || normalized.contains("deepseek-v4")
+        guard supportsExplicitThinking else { return nil }
+        switch purpose {
+        case .translation: return false
+        case .backgroundCard: return true
+        }
+    }
+
+    static func applyThinkingMode(
+        to payload: inout [String: Any],
+        model: String,
+        purpose: TranslationRequestPurpose
+    ) {
+        guard let enabled = thinkingMode(model: model, purpose: purpose) else { return }
+        payload["enable_thinking"] = enabled
+        if enabled {
+            // DashScope rejects JSON mode while thinking is enabled. The prompt
+            // and response decoder still enforce the background-card schema.
+            payload["response_format"] = nil
         }
     }
 }
@@ -61,7 +109,7 @@ final class TranslationService {
         Return only valid JSON with exactly this shape: {\"segments\":[{\"id\":\"unchanged-id\",\"text\":\"translated text\"}]}.
         Copy every target id exactly and translate only target text values. Never return context-only ids.
         """
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "model": configuration.model,
             "temperature": 0.2,
             "response_format": ["type": "json_object"],
@@ -70,6 +118,11 @@ final class TranslationService {
                 ["role": "user", "content": sourceJSON],
             ],
         ]
+        TranslationRequestPolicy.applyThinkingMode(
+            to: &payload,
+            model: configuration.model,
+            purpose: .translation
+        )
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
             completion(.failure(TranslationError.malformedResponse))
             return
@@ -80,24 +133,53 @@ final class TranslationService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = body
-        request.timeoutInterval = 45
+        request.timeoutInterval = TranslationRequestPolicy.translationTimeout
 
         URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error { return completion(.failure(error)) }
+            if let error {
+                DiagnosticLogger.shared.record("translation.http.transport_error", fields: [
+                    "model": configuration.model,
+                    "endpoint_host": url.host ?? "",
+                    "error_type": String(reflecting: type(of: error)),
+                    "error": error.localizedDescription,
+                ])
+                return completion(.failure(error))
+            }
             guard let http = response as? HTTPURLResponse, let data else {
+                DiagnosticLogger.shared.record("translation.http.missing_response", fields: [
+                    "model": configuration.model,
+                    "endpoint_host": url.host ?? "",
+                ])
                 completion(.failure(TranslationError.malformedResponse))
                 return
             }
+            DiagnosticLogger.shared.record("translation.http.response_received", fields: [
+                "model": configuration.model,
+                "endpoint_host": url.host ?? "",
+                "status_code": String(http.statusCode),
+                "response_bytes": String(data.count),
+            ])
             guard (200..<300).contains(http.statusCode) else {
                 let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
                     .flatMap { $0["error"] as? [String: Any] }?["message"] as? String
-                completion(.failure(TranslationError.requestFailed(message ?? "翻译请求失败（\(http.statusCode)）。")))
+                let retryAfter = Self.retryAfter(from: http)
+                completion(.failure(TranslationError.requestFailed(
+                    statusCode: http.statusCode,
+                    message: message ?? "翻译请求失败（\(http.statusCode)）。",
+                    retryAfter: retryAfter
+                )))
                 return
             }
             guard let envelope = try? JSONDecoder().decode(ChatEnvelope.self, from: data),
                   let content = envelope.choices.first?.message.content,
                   let jsonData = Self.extractJSON(from: content).data(using: .utf8),
                   let translated = try? JSONDecoder().decode(TranslatedBatch.self, from: jsonData) else {
+                DiagnosticLogger.shared.record("translation.http.response_decode_failed", fields: [
+                    "model": configuration.model,
+                    "endpoint_host": url.host ?? "",
+                    "status_code": String(http.statusCode),
+                    "response_bytes": String(data.count),
+                ])
                 completion(.failure(TranslationError.malformedResponse))
                 return
             }
@@ -158,7 +240,7 @@ final class TranslationService {
         {"overview":"...","chapters":[{"start":0,"end":120,"title":"..."}],"domain":"...","tone":"...","entities":[{"source":"...","preferred_zh":"...","evidence_ids":["cue-id"]}],"terminology":[{"source":"...","preferred_zh":"...","evidence_ids":["cue-id"]}],"uncertainties":[{"cue_id":"cue-id","note":"..."}]}.
         Keep the entire result compact. The overview and card are reference context, never a license to add content absent from a subtitle line.
         """
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "model": configuration.model,
             "temperature": 0.1,
             "response_format": ["type": "json_object"],
@@ -167,6 +249,11 @@ final class TranslationService {
                 ["role": "user", "content": sourceJSON],
             ],
         ]
+        TranslationRequestPolicy.applyThinkingMode(
+            to: &payload,
+            model: configuration.model,
+            purpose: .backgroundCard
+        )
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
             completion(.failure(TranslationError.malformedResponse))
             return
@@ -177,7 +264,7 @@ final class TranslationService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = body
-        request.timeoutInterval = 180
+        request.timeoutInterval = TranslationRequestPolicy.backgroundCardTimeout
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error { return completion(.failure(error)) }
@@ -188,7 +275,11 @@ final class TranslationService {
             guard (200..<300).contains(http.statusCode) else {
                 let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
                     .flatMap { $0["error"] as? [String: Any] }?["message"] as? String
-                completion(.failure(TranslationError.requestFailed(message ?? "视频背景分析失败（\(http.statusCode)）。")))
+                completion(.failure(TranslationError.requestFailed(
+                    statusCode: http.statusCode,
+                    message: message ?? "视频背景分析失败（\(http.statusCode)）。",
+                    retryAfter: Self.retryAfter(from: http)
+                )))
                 return
             }
             guard let envelope = try? JSONDecoder().decode(ChatEnvelope.self, from: data),
@@ -222,6 +313,25 @@ final class TranslationService {
     private static func extractJSON(from text: String) -> String {
         guard let first = text.firstIndex(of: "{"), let last = text.lastIndex(of: "}") else { return text }
         return String(text[first...last])
+    }
+
+    private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
+        guard let value = response.value(forHTTPHeaderField: "Retry-After") else { return nil }
+        if let seconds = TimeInterval(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return max(0, seconds)
+        }
+        guard let date = HTTPDateParser.date(from: value) else { return nil }
+        return max(0, date.timeIntervalSinceNow)
+    }
+}
+
+private enum HTTPDateParser {
+    static func date(from value: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
+        return formatter.date(from: value)
     }
 }
 
