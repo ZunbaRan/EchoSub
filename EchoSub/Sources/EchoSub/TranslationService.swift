@@ -37,7 +37,7 @@ enum TranslationRequestPurpose {
 }
 
 enum TranslationRequestPolicy {
-    static let batchSize = 12
+    static let batchSize = 4
     static let translationTimeout: TimeInterval = 120
     static let backgroundCardTimeout: TimeInterval = 180
 

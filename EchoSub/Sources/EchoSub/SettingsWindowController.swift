@@ -223,11 +223,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTa
         let provider = NSPopUpButton()
         provider.addItems(withTitles: ["OpenAI 兼容接口"])
         let base = NSTextField(string: settings.translationBaseURL)
-        base.placeholderString = "https://api.openai.com/v1"
+        base.placeholderString = "https://dashscope.aliyuncs.com/compatible-mode/v1"
         styleInput(base)
         baseURLField = base
         let model = NSTextField(string: settings.translationModel)
-        model.placeholderString = "gpt-4o-mini"
+        model.placeholderString = "qwen3.7-plus"
         styleInput(model)
         modelField = model
         let key = NSSecureTextField(string: PlaintextCredentialStore.shared.loadTranslationAPIKey())

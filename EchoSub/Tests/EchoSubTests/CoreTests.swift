@@ -93,7 +93,7 @@ struct CoreTests {
 
     @Test("Long subtitle jobs use smaller batches and a realistic request timeout")
     func longVideoTranslationPolicy() {
-        #expect(TranslationRequestPolicy.batchSize == 12)
+        #expect(TranslationRequestPolicy.batchSize == 4)
         #expect(TranslationRequestPolicy.translationTimeout == 120)
         #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 1, error: TranslationError.malformedResponse) == 5)
         #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 2, error: TranslationError.malformedResponse) == 15)

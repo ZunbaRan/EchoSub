@@ -149,12 +149,12 @@ final class AppSettings {
     }
 
     var translationBaseURL: String {
-        get { defaults.string(forKey: "translationBaseURL") ?? "https://api.openai.com/v1" }
+        get { defaults.string(forKey: "translationBaseURL") ?? "https://dashscope.aliyuncs.com/compatible-mode/v1" }
         set { defaults.set(newValue, forKey: "translationBaseURL"); changed() }
     }
 
     var translationModel: String {
-        get { defaults.string(forKey: "translationModel") ?? "gpt-4o-mini" }
+        get { defaults.string(forKey: "translationModel") ?? "qwen3.7-plus" }
         set { defaults.set(newValue, forKey: "translationModel"); changed() }
     }
 
