@@ -5,9 +5,9 @@ final class AppState {
 
     private let store = LibraryStore()
     private let transcriptService = YouTubeTranscriptService()
-    private let translationService = TranslationService()
-    private let diagnostics = DiagnosticLogger.shared
-    private(set) var library: AppLibrary
+    let translationService = TranslationService()
+    let diagnostics = DiagnosticLogger.shared
+    var library: AppLibrary
     private(set) var currentVideoID: String?
     private(set) var playbackTime: Double = 0
     private(set) var lastErrorMessage: String?
@@ -15,6 +15,11 @@ final class AppState {
     private var backgroundCardJobs: [String: UUID] = [:]
     private var backgroundCardErrors: [String: String] = [:]
     private var backgroundCardCompletions: [String: [(VideoBackgroundCard?) -> Void]] = [:]
+    var glossJobs: [String: UUID] = [:]
+    var glossErrors: [String: String] = [:]
+    var detailJobs: [String: UUID] = [:]
+    var detailErrors: [String: String] = [:]
+    var detailCompletions: [String: [(Result<VocabDetail, Error>) -> Void]] = [:]
 
     private init() {
         library = store.load()
@@ -112,6 +117,11 @@ final class AppState {
 
     func removeVideo(_ videoID: String) {
         translationJobs.cancel(videoID: videoID)
+        glossJobs = glossJobs.filter { !$0.key.hasPrefix("\(videoID)|") }
+        glossErrors = glossErrors.filter { !$0.key.hasPrefix("\(videoID)|") }
+        detailJobs = detailJobs.filter { !$0.key.hasPrefix("\(videoID)|") }
+        detailErrors = detailErrors.filter { !$0.key.hasPrefix("\(videoID)|") }
+        detailCompletions = detailCompletions.filter { !$0.key.hasPrefix("\(videoID)|") }
         library.deleteVideo(videoID)
         backgroundCardJobs[videoID] = nil
         backgroundCardErrors[videoID] = nil
@@ -124,6 +134,7 @@ final class AppState {
         persist()
         NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
         NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
+        NotificationCenter.default.post(name: .echoVocabularyChanged, object: nil)
     }
 
     func hideVideo(_ videoID: String) {
@@ -173,12 +184,12 @@ final class AppState {
 
     func retranslateAll() {
         guard let currentVideoID else { return }
-        startTranslation(videoID: currentVideoID, scope: .all, clearExisting: true)
+        startTranslation(videoID: currentVideoID, scope: .all, clearExisting: true, clearUserOverrides: true)
     }
 
     func translateSegment(id: String) {
         guard let currentVideoID else { return }
-        startTranslation(videoID: currentVideoID, scope: .segment(id))
+        startTranslation(videoID: currentVideoID, scope: .segment(id), clearUserOverrides: true)
     }
 
     func regenerateBackgroundCard(preservingUserTerms: Bool = false) {
@@ -210,29 +221,43 @@ final class AppState {
         videoID: String,
         scope: TranslationScope,
         clearExisting: Bool = false,
+        clearUserOverrides: Bool = false,
         backgroundAttempted: Bool = false
     ) {
         guard let video = library.videos.first(where: { $0.id == videoID }),
-              var document = library.transcripts[videoID] else { return }
-        let work = TranslationWorkPlan.segments(from: document, scope: scope)
-        guard !work.isEmpty else { return }
+              let originalDocument = library.transcripts[videoID] else { return }
         let config = AppSettings.shared.translationConfiguration
-        guard !config.apiKey.isEmpty else {
+        let plan = TranslationStartPlan.make(
+            document: originalDocument,
+            scope: scope,
+            apiKey: config.apiKey,
+            hasBackgroundCard: library.backgroundCards[video.id] != nil,
+            backgroundAttempted: backgroundAttempted,
+            clearExisting: clearExisting,
+            clearUserOverrides: clearUserOverrides
+        )
+        var document = originalDocument
+        if plan.shouldApplyCleanup {
+            document = plan.applyingCleanup(to: document)
+            library.transcripts[video.id] = document
+            persist()
+            NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
+            if plan.clearUserOverrides {
+                NotificationCenter.default.post(name: .echoVocabularyChanged, object: nil)
+            }
+        }
+        let work = plan.work
+        guard !work.isEmpty else { return }
+        guard plan.readiness != .notConfigured else {
             lastErrorMessage = TranslationError.notConfigured.localizedDescription
             NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
             return
         }
-        if library.backgroundCards[video.id] == nil, !backgroundAttempted {
+        if plan.readiness == .waitingForBackgroundCard {
             requestBackgroundCard(videoID: video.id, force: false) { [weak self] _ in
-                self?.startTranslation(videoID: video.id, scope: scope, clearExisting: clearExisting, backgroundAttempted: true)
+                self?.startTranslation(videoID: video.id, scope: scope, clearExisting: clearExisting, clearUserOverrides: clearUserOverrides, backgroundAttempted: true)
             }
             return
-        }
-        if clearExisting {
-            for index in document.segments.indices { document.segments[index].translation = nil }
-            library.transcripts[video.id] = document
-            persist()
-            NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
         }
         let jobID = UUID()
         if let previousJobID = translationJobs.jobID(for: video.id) {
@@ -264,14 +289,21 @@ final class AppState {
     func clearTranscriptCache() {
         library.transcripts.removeAll()
         library.backgroundCards.removeAll()
+        library.detailCache.removeAll()
         backgroundCardJobs.removeAll()
         backgroundCardErrors.removeAll()
         backgroundCardCompletions.removeAll()
+        glossJobs.removeAll()
+        glossErrors.removeAll()
+        detailJobs.removeAll()
+        detailErrors.removeAll()
+        detailCompletions.removeAll()
         translationJobs.cancelAll()
         for index in library.videos.indices { library.videos[index].status = .idle }
         persist()
         NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
         NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
+        NotificationCenter.default.post(name: .echoVocabularyChanged, object: nil)
     }
 
     func clearAllHistory() {
@@ -279,6 +311,10 @@ final class AppState {
         backgroundCardJobs.removeAll()
         backgroundCardErrors.removeAll()
         backgroundCardCompletions.removeAll()
+        glossJobs.removeAll()
+        glossErrors.removeAll()
+        detailJobs.removeAll()
+        detailErrors.removeAll()
         translationJobs.cancelAll()
         currentVideoID = nil
         playbackTime = 0
@@ -286,6 +322,7 @@ final class AppState {
         NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
         NotificationCenter.default.post(name: .echoCurrentVideoChanged, object: nil)
         NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
+        NotificationCenter.default.post(name: .echoVocabularyChanged, object: nil)
     }
 
     private func fetchTranscript(for videoID: String) {
@@ -573,5 +610,5 @@ final class AppState {
         }
     }
 
-    private func persist() { store.save(library) }
+    func persist() { store.save(library) }
 }

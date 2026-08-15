@@ -84,8 +84,74 @@ struct SubtitleSegment: Codable, Identifiable, Equatable {
     var end: Double
     var original: String
     var translation: String?
+    var zhUserOverride: String?
+    var glosses: [GlossEntry]
+
+    init(
+        id: String,
+        start: Double,
+        end: Double,
+        original: String,
+        translation: String? = nil,
+        zhUserOverride: String? = nil,
+        glosses: [GlossEntry] = []
+    ) {
+        self.id = id
+        self.start = start
+        self.end = end
+        self.original = original
+        self.translation = translation
+        self.zhUserOverride = zhUserOverride
+        self.glosses = glosses
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, start, end, original, translation, zhUserOverride, translationOverride, glosses
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        start = try container.decode(Double.self, forKey: .start)
+        end = try container.decode(Double.self, forKey: .end)
+        original = try container.decode(String.self, forKey: .original)
+        translation = try container.decodeIfPresent(String.self, forKey: .translation)
+        zhUserOverride = try container.decodeIfPresent(String.self, forKey: .zhUserOverride)
+            ?? container.decodeIfPresent(String.self, forKey: .translationOverride)
+        glosses = try container.decodeIfPresent([GlossEntry].self, forKey: .glosses) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(start, forKey: .start)
+        try container.encode(end, forKey: .end)
+        try container.encode(original, forKey: .original)
+        try container.encodeIfPresent(translation, forKey: .translation)
+        try container.encodeIfPresent(zhUserOverride, forKey: .zhUserOverride)
+        try container.encode(glosses, forKey: .glosses)
+    }
 
     var duration: Double { max(0, end - start) }
+
+    var translationOverride: String? {
+        get { zhUserOverride }
+        set { zhUserOverride = newValue }
+    }
+
+    var effectiveTranslation: String? {
+        if let override = zhUserOverride?.trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            return override
+        }
+        if let translation = translation?.trimmingCharacters(in: .whitespacesAndNewlines), !translation.isEmpty {
+            return self.translation
+        }
+        return nil
+    }
+
+    var displayTranslation: String? { effectiveTranslation }
+
+    var hasEffectiveTranslation: Bool { effectiveTranslation != nil }
 }
 
 struct TranscriptDocument: Codable, Equatable {
@@ -191,6 +257,7 @@ struct AppLibrary: Codable {
     var videos: [VideoItem] = []
     var transcripts: [String: TranscriptDocument] = [:]
     var backgroundCards: [String: VideoBackgroundCard] = [:]
+    var detailCache: [String: VocabDetail] = [:]
     var hiddenVideoIDs: Set<String> = []
 
     var visibleVideos: [VideoItem] { videos.filter { !hiddenVideoIDs.contains($0.id) } }
@@ -200,16 +267,37 @@ struct AppLibrary: Codable {
         videos: [VideoItem] = [],
         transcripts: [String: TranscriptDocument] = [:],
         backgroundCards: [String: VideoBackgroundCard] = [:],
+        detailCache: [String: VocabDetail] = [:],
         hiddenVideoIDs: Set<String> = []
     ) {
         self.videos = videos
         self.transcripts = transcripts
         self.backgroundCards = backgroundCards
+        self.detailCache = detailCache
         self.hiddenVideoIDs = hiddenVideoIDs
     }
 
+    var vocabDetailCache: [String: VocabDetail] {
+        get { detailCache }
+        set { detailCache = newValue }
+    }
+
+    var vocabDetails: [String: VocabDetail] {
+        get { detailCache }
+        set { detailCache = newValue }
+    }
+
     private enum CodingKeys: String, CodingKey {
-        case videos, transcripts, backgroundCards, hiddenVideoIDs
+        case videos, transcripts, backgroundCards, detailCache, vocabDetailCache, hiddenVideoIDs
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(videos, forKey: .videos)
+        try container.encode(transcripts, forKey: .transcripts)
+        try container.encode(backgroundCards, forKey: .backgroundCards)
+        try container.encode(detailCache, forKey: .detailCache)
+        try container.encode(hiddenVideoIDs, forKey: .hiddenVideoIDs)
     }
 
     init(from decoder: Decoder) throws {
@@ -217,6 +305,9 @@ struct AppLibrary: Codable {
         videos = try container.decodeIfPresent([VideoItem].self, forKey: .videos) ?? []
         transcripts = try container.decodeIfPresent([String: TranscriptDocument].self, forKey: .transcripts) ?? [:]
         backgroundCards = try container.decodeIfPresent([String: VideoBackgroundCard].self, forKey: .backgroundCards) ?? [:]
+        detailCache = try container.decodeIfPresent([String: VocabDetail].self, forKey: .detailCache)
+            ?? container.decodeIfPresent([String: VocabDetail].self, forKey: .vocabDetailCache)
+            ?? [:]
         hiddenVideoIDs = try container.decodeIfPresent(Set<String>.self, forKey: .hiddenVideoIDs) ?? []
         hiddenVideoIDs.formIntersection(Set(videos.map(\.id)))
     }
@@ -252,6 +343,7 @@ struct AppLibrary: Codable {
         videos.removeAll { $0.id == videoID }
         transcripts[videoID] = nil
         backgroundCards[videoID] = nil
+        detailCache = detailCache.filter { !VocabDetailCacheKey.belongsToVideo($0.key, videoID: videoID) }
         hiddenVideoIDs.remove(videoID)
     }
 }
@@ -279,7 +371,8 @@ enum FloatingSubtitleLayout {
         for segment: SubtitleSegment,
         mode: SubtitleDisplayMode,
         availableWidth: CGFloat,
-        fontSize: CGFloat
+        fontSize: CGFloat,
+        glossState: GlossLookupState = .idle
     ) -> CGFloat {
         let width = max(100, availableWidth)
         // Every row reserves space for the highlighted rendering. The active
@@ -295,7 +388,17 @@ enum FloatingSubtitleLayout {
         var height: CGFloat = 16
         if mode != .translated { height += textHeight(segment.original, font: originalFont) }
         if mode == .bilingual { height += 5 }
-        if mode != .original { height += textHeight(segment.translation ?? "等待翻译…", font: translatedFont) }
+        if mode != .original { height += textHeight(segment.effectiveTranslation ?? "等待翻译…", font: translatedFont) }
+        if mode != .original, !segment.glosses.isEmpty {
+            let glossText = segment.glosses.map { "✨ \($0.surface) · \($0.gloss)" }.joined(separator: "  ┆  ")
+            height += 5 + textHeight(glossText, font: NSFont.systemFont(ofSize: max(10, fontSize - 6)))
+        }
+        switch glossState {
+        case .loading, .failed:
+            if mode != .original { height += 5 + 24 }
+        case .idle:
+            break
+        }
         return max(54, height)
     }
 }
@@ -353,11 +456,132 @@ enum TranslationScope: Equatable {
     case segment(String)
 }
 
+struct SubtitleDraftKey: Hashable {
+    let videoID: String
+    let segmentID: String
+}
+
+struct SubtitleDraftStore {
+    private var values: [SubtitleDraftKey: String] = [:]
+
+    func value(videoID: String, segmentID: String) -> String? {
+        values[SubtitleDraftKey(videoID: videoID, segmentID: segmentID)]
+    }
+
+    mutating func update(videoID: String, segmentID: String, text: String) {
+        values[SubtitleDraftKey(videoID: videoID, segmentID: segmentID)] = text
+    }
+
+    mutating func remove(videoID: String, segmentID: String) {
+        values[SubtitleDraftKey(videoID: videoID, segmentID: segmentID)] = nil
+    }
+
+    mutating func removeVideo(_ videoID: String) {
+        values = values.filter { $0.key.videoID != videoID }
+    }
+
+    mutating func removeAll() {
+        values.removeAll()
+    }
+}
+
+struct SubtitleEditingTarget: Equatable {
+    let videoID: String
+    let segmentID: String
+}
+
+struct SubtitleEditingState: Equatable {
+    private(set) var target: SubtitleEditingTarget?
+
+    mutating func begin(videoID: String, segmentID: String) {
+        target = SubtitleEditingTarget(videoID: videoID, segmentID: segmentID)
+    }
+
+    mutating func end() {
+        target = nil
+    }
+
+    func isEditing(videoID: String, segmentID: String) -> Bool {
+        target == SubtitleEditingTarget(videoID: videoID, segmentID: segmentID)
+    }
+}
+
+enum TranslationStartReadiness: Equatable {
+    case noWork
+    case notConfigured
+    case waitingForBackgroundCard
+    case ready
+}
+
+struct TranslationStartPlan {
+    let readiness: TranslationStartReadiness
+    let scope: TranslationScope
+    let work: [SubtitleSegment]
+    let clearExisting: Bool
+    let clearUserOverrides: Bool
+
+    static func make(
+        document: TranscriptDocument,
+        scope: TranslationScope,
+        apiKey: String,
+        hasBackgroundCard: Bool,
+        backgroundAttempted: Bool,
+        clearExisting: Bool = false,
+        clearUserOverrides: Bool = false
+    ) -> TranslationStartPlan {
+        let work = TranslationWorkPlan.segments(from: document, scope: scope)
+        let readiness: TranslationStartReadiness
+        if work.isEmpty {
+            readiness = .noWork
+        } else if apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            readiness = .notConfigured
+        } else if !hasBackgroundCard, !backgroundAttempted {
+            readiness = .waitingForBackgroundCard
+        } else {
+            readiness = .ready
+        }
+        return TranslationStartPlan(
+            readiness: readiness,
+            scope: scope,
+            work: work,
+            clearExisting: clearExisting,
+            clearUserOverrides: clearUserOverrides
+        )
+    }
+
+    var shouldApplyCleanup: Bool {
+        readiness == .ready && (clearExisting || clearUserOverrides)
+    }
+
+    func applyingCleanup(to document: TranscriptDocument) -> TranscriptDocument {
+        guard shouldApplyCleanup else { return document }
+        var updated = document
+        if clearUserOverrides {
+            let affectedIDs: Set<String>
+            switch scope {
+            case .all, .missing:
+                affectedIDs = Set(updated.segments.map(\.id))
+            case .segment(let id):
+                affectedIDs = [id]
+            }
+            for index in updated.segments.indices where affectedIDs.contains(updated.segments[index].id) {
+                updated.segments[index].zhUserOverride = nil
+            }
+        }
+        if clearExisting {
+            for index in updated.segments.indices {
+                updated.segments[index].translation = nil
+            }
+        }
+        return updated
+    }
+}
+
 enum TranslationWorkPlan {
     static func segments(from document: TranscriptDocument, scope: TranslationScope) -> [SubtitleSegment] {
         switch scope {
         case .missing:
-            return document.segments.filter { $0.translation?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false }
+            return document.segments.filter { !$0.hasEffectiveTranslation }
         case .all:
             return document.segments
         case .segment(let id):
@@ -411,6 +635,7 @@ extension Notification.Name {
     static let echoCurrentVideoChanged = Notification.Name("EchoSub.currentVideoChanged")
     static let echoTranscriptChanged = Notification.Name("EchoSub.transcriptChanged")
     static let echoBackgroundCardChanged = Notification.Name("EchoSub.backgroundCardChanged")
+    static let echoVocabularyChanged = Notification.Name("EchoSub.vocabularyChanged")
     static let echoPlaybackTimeChanged = Notification.Name("EchoSub.playbackTimeChanged")
     static let echoSettingsChanged = Notification.Name("EchoSub.settingsChanged")
     static let echoToggleFloatingWindow = Notification.Name("EchoSub.toggleFloatingWindow")

@@ -32,6 +32,8 @@ enum TranslationRetryPolicy {
 enum TranslationRequestPurpose {
     case translation
     case backgroundCard
+    case gloss
+    case detail
 }
 
 enum TranslationRequestPolicy {
@@ -46,6 +48,8 @@ enum TranslationRequestPolicy {
         switch purpose {
         case .translation: return false
         case .backgroundCard: return true
+        case .gloss: return false
+        case .detail: return true
         }
     }
 
@@ -88,7 +92,7 @@ final class TranslationService {
         let contextRows = context.map { segment -> [String: String] in
             var row = ["id": segment.id, "text": segment.original]
             if !targetIDs.contains(segment.id),
-               let translation = segment.translation?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let translation = segment.effectiveTranslation?.trimmingCharacters(in: .whitespacesAndNewlines),
                !translation.isEmpty {
                 row["existing_translation"] = translation
             }

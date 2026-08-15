@@ -15,10 +15,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     private let modeControl = NSSegmentedControl(labels: ["原文", "中文", "双语"], trackingMode: .selectOne, target: nil, action: nil)
     private let followButton = EchoStyle.iconButton("scope", help: "自动跟随", target: nil, action: nil)
     private let backgroundCardButton = EchoStyle.button("背景卡", symbol: "sparkles", target: nil, action: nil)
+    private let vocabularyButton = EchoStyle.button("本片词汇 0", symbol: "text.book.closed", target: nil, action: nil)
     private let subtitleFooter = EchoStyle.label("", size: 11, color: EchoStyle.textTertiary)
     private let playlistContainer = NSView()
     private let subtitleContainer = NSView()
     private let backgroundCardPanel = BackgroundCardPanel()
+    private let vocabularyPanel = VideoVocabularyPanel()
+    private let detailPopover = VocabDetailPopover()
     private let playlistToggleButton = EchoStyle.iconButton("sidebar.left", help: "折叠播放列表", target: nil, action: nil)
     private let subtitleToggleButton = EchoStyle.iconButton("sidebar.right", help: "折叠字幕", target: nil, action: nil)
     private let nativeFullscreenButton = EchoStyle.iconButton("arrow.up.left.and.arrow.down.right", help: "播放器窗口全屏", target: nil, action: nil)
@@ -40,9 +43,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     private var isApplyingSplitLayout = false
     private var playerWindowOverlay: PlayerWindowOverlay?
     private var observers: [NSObjectProtocol] = []
+    private let selectionPresenter = SelectionActionPresenter.shared
+    private var selectionContext: VocabularySelectionContext?
+    private var editingState = SubtitleEditingState()
+    private var subtitleDrafts = SubtitleDraftStore()
+    private var suppressNextSubtitleSeek = false
+    private var detailBackStack: [DetailContext] = []
+    private var visibleDetailContext: DetailContext?
+    private var visibleDetailIdentity: VocabDetailRequestIdentity?
+
+    private struct DetailContext {
+        let entry: GlossEntry
+        let segmentID: String
+        let videoID: String
+        let anchorView: NSView
+        let anchorRect: NSRect
+    }
 
     init() {
-        let window = NSWindow(
+        let window = VocabularyMainWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1180, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -56,6 +75,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         window.setFrameAutosaveName("EchoSub.main")
         super.init(window: window)
         window.delegate = self
+        window.onGlossShortcut = { [weak self] in self?.performGlossShortcut() ?? false }
+        window.onDetailShortcut = { [weak self] in self?.performDetailShortcut() ?? false }
+        detailPopover.detailContentView.onRetry = { [weak self] in self?.retryVisibleDetail() }
+        detailPopover.detailContentView.onSeek = { [weak self] seconds in
+            self?.playerView.seek(to: seconds)
+            self?.state.updatePlaybackTime(seconds)
+        }
+        detailPopover.detailContentView.onRelated = { [weak self] related in self?.lookupRelatedWord(related) }
+        detailPopover.detailContentView.onBack = { [weak self] in self?.goBackDetail() }
         buildInterface()
         bindState()
         refreshAll()
@@ -322,12 +350,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         autoFollow = settings.autoFollow
 
         let title = EchoStyle.label("字幕", size: 13, weight: .semibold)
+        vocabularyButton.target = self
+        vocabularyButton.action = #selector(showVocabulary)
+        vocabularyButton.isBordered = false
+        vocabularyButton.contentTintColor = EchoStyle.textSecondary
         backgroundCardButton.target = self
         backgroundCardButton.action = #selector(showBackgroundCard)
         backgroundCardButton.isBordered = false
         backgroundCardButton.contentTintColor = EchoStyle.textSecondary
         let more = EchoStyle.iconButton("ellipsis", help: "翻译选项", target: self, action: #selector(showTranslationMenu(_:)))
-        let header = NSStackView(views: [title, modeControl, NSView(), backgroundCardButton, followButton, more])
+        let header = NSStackView(views: [title, modeControl, NSView(), vocabularyButton, backgroundCardButton, followButton, more])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 8
@@ -347,6 +379,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         let retryLine = NSMenuItem(title: "补翻 / 重试此句", action: #selector(retryClickedSubtitle), keyEquivalent: "")
         retryLine.target = self
         contextMenu.addItem(retryLine)
+        let editLine = NSMenuItem(title: "编辑译文", action: #selector(editClickedSubtitle), keyEquivalent: "")
+        editLine.target = self
+        contextMenu.addItem(editLine)
+        let lookupLine = NSMenuItem(title: "讲解选词", action: #selector(lookupSelectedWordFromMenu), keyEquivalent: "")
+        lookupLine.target = self
+        contextMenu.addItem(lookupLine)
         subtitleTable.menu = contextMenu
         let scroll = NSScrollView()
         scroll.documentView = subtitleTable
@@ -376,6 +414,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             self?.state.updatePlaybackTime(seconds)
         }
         subtitleContainer.addSubview(backgroundCardPanel)
+        vocabularyPanel.isHidden = true
+        vocabularyPanel.onClose = { [weak self] in self?.hideVocabulary() }
+        vocabularyPanel.onSelectDetail = { [weak self] entry in self?.showDetail(for: entry) }
+        vocabularyPanel.onRemove = { [weak self] entry in
+            guard let self else { return }
+            if self.visibleDetailContext?.videoID == entry.videoID,
+               self.visibleDetailContext?.segmentID == entry.segmentID,
+               self.visibleDetailContext?.entry.id == entry.gloss.id {
+                self.clearDetailPresentation()
+            }
+            self.state.removeGloss(id: entry.gloss.id, from: entry.segmentID, videoID: entry.videoID)
+        }
+        vocabularyPanel.onSeek = { [weak self] seconds in
+            self?.playerView.seek(to: seconds)
+            self?.state.updatePlaybackTime(seconds)
+        }
+        subtitleContainer.addSubview(vocabularyPanel)
         NSLayoutConstraint.activate([
             header.leadingAnchor.constraint(equalTo: subtitleContainer.leadingAnchor, constant: 14),
             header.trailingAnchor.constraint(equalTo: subtitleContainer.trailingAnchor, constant: -10),
@@ -395,6 +450,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             subtitleFooter.heightAnchor.constraint(equalToConstant: 20),
         ])
         backgroundCardPanel.pinEdges(to: subtitleContainer)
+        vocabularyPanel.pinEdges(to: subtitleContainer)
         refreshFollowButton()
         refreshLoopButton()
         return subtitleContainer
@@ -405,6 +461,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         observers.append(center.addObserver(forName: .echoLibraryChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshLibrary() })
         observers.append(center.addObserver(forName: .echoCurrentVideoChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshCurrentVideo() })
         observers.append(center.addObserver(forName: .echoTranscriptChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshTranscript() })
+        observers.append(center.addObserver(forName: .echoVocabularyChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshVocabulary() })
         observers.append(center.addObserver(forName: .echoBackgroundCardChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshBackgroundCard() })
         observers.append(center.addObserver(forName: .echoPlaybackTimeChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshPlaybackPosition() })
         observers.append(center.addObserver(forName: .echoSettingsChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshSubtitleAppearance() })
@@ -419,6 +476,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         refreshCurrentVideo()
         refreshTranscript()
         refreshBackgroundCard()
+        refreshVocabulary()
     }
 
     private func refreshLibrary() {
@@ -436,6 +494,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     }
 
     private func refreshCurrentVideo() {
+        clearSelectionContext()
+        clearEditingDraft()
+        clearDetailPresentation()
         guard let video = state.currentVideo else {
             titleLabel.stringValue = "粘贴一个 YouTube 链接开始"
             channelLabel.stringValue = "无需登录，公开视频即可生成双语字幕"
@@ -457,6 +518,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         refreshLibrary()
         refreshTranscript()
         refreshBackgroundCard()
+        refreshVocabulary()
     }
 
     private func refreshTranscript() {
@@ -472,7 +534,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             subtitleFooter.stringValue = "正在获取字幕…"
         case .translating:
             let total = state.currentTranscript?.segments.count ?? 0
-            let done = state.currentTranscript?.segments.filter { $0.translation?.isEmpty == false }.count ?? 0
+            let done = state.currentTranscript?.segments.filter(\.hasEffectiveTranslation).count ?? 0
             subtitleFooter.stringValue = "正在翻译 \(done) / \(total) 句"
         case .failed:
             subtitleFooter.stringValue = state.lastErrorMessage ?? "字幕或翻译失败，可点击右上角重试。"
@@ -523,6 +585,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             )
         }
         refreshTranscript()
+    }
+
+    private func refreshVocabulary() {
+        vocabularyButton.title = "本片词汇 \(state.currentVocabularyCount)"
+        vocabularyButton.isEnabled = state.currentTranscript != nil
+        vocabularyButton.contentTintColor = state.currentVocabularyCount > 0 ? EchoStyle.accent : EchoStyle.textSecondary
+        if !vocabularyPanel.isHidden {
+            vocabularyPanel.render(video: state.currentVideo, entries: state.currentVocabularyEntries)
+        }
+        invalidateSubtitleRowHeights()
+        subtitleTable.reloadData()
     }
 
     private func refreshPlaybackPosition() {
@@ -620,6 +693,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         subtitleTable.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<subtitleTable.numberOfRows))
     }
 
+    private func reloadSubtitleRows(for segmentIDs: [String]) {
+        guard let segments = state.currentTranscript?.segments else { return }
+        var indexes = IndexSet()
+        for segmentID in segmentIDs {
+            if let row = segments.firstIndex(where: { $0.id == segmentID }) {
+                indexes.insert(row)
+            }
+        }
+        guard !indexes.isEmpty else { return }
+        subtitleTable.noteHeightOfRows(withIndexesChanged: indexes)
+        subtitleTable.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
+    }
+
     func numberOfRows(in tableView: NSTableView) -> Int {
         tableView === playlistTable ? playlistVideos.count : (state.currentTranscript?.segments.count ?? 0)
     }
@@ -629,17 +715,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         guard let segment = state.currentTranscript?.segments[safe: row] else { return 64 }
         let mode = SubtitleDisplayMode(rawValue: modeControl.selectedSegment) ?? .bilingual
         let width = max(120, subtitleTable.bounds.width - 70)
-        func textHeight(_ text: String, font: NSFont) -> CGFloat {
-            ceil(NSAttributedString(string: text, attributes: [.font: font]).boundingRect(
-                with: NSSize(width: width, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading]
-            ).height)
-        }
-        var height: CGFloat = 18
-        if mode != .translated { height += textHeight(segment.original, font: .systemFont(ofSize: 13, weight: .medium)) }
-        if mode == .bilingual { height += 5 }
-        if mode != .original { height += textHeight(segment.translation ?? "等待翻译…", font: .systemFont(ofSize: 12)) }
-        return max(54, height)
+        return SubtitleRowLayout.rowHeight(
+            for: segment,
+            mode: mode,
+            availableWidth: width,
+            editing: isEditing(segmentID: segment.id),
+            glossState: state.glossState(for: segment.id)
+        )
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -652,7 +734,88 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         guard let segment = state.currentTranscript?.segments[safe: row] else { return nil }
         let view = tableView.makeView(withIdentifier: SubtitleCell.identifier, owner: self) as? SubtitleCell ?? SubtitleCell()
         let mode = SubtitleDisplayMode(rawValue: modeControl.selectedSegment) ?? .bilingual
-        view.configure(segment, mode: mode, current: row == currentSubtitleRow)
+        view.onSelectionToolbar = { [weak self] cell, textView, surface, rect in
+            self?.presentSelection(textView: textView, surface: surface, rect: rect)
+        }
+        view.onDoubleClickGloss = { [weak self] cell, textView, surface in
+            guard let videoID = textView.representedVideoID,
+                  let segmentID = textView.representedSegmentID else { return }
+            _ = self?.performGloss(textView: textView, surface: surface, videoID: videoID, segmentID: segmentID)
+        }
+        view.onContextualGloss = { [weak self] _, textView, surface in
+            guard let videoID = textView.representedVideoID,
+                  let segmentID = textView.representedSegmentID else { return }
+            _ = self?.performGloss(textView: textView, surface: surface, videoID: videoID, segmentID: segmentID)
+        }
+        view.onPlainEnglishClick = { [weak self] cell in
+            guard let self else { return }
+            let row = self.subtitleTable.row(for: cell)
+            guard row >= 0 else { return }
+            self.seekSubtitleRow(row)
+        }
+        view.onTextInteractionBegan = { [weak self] in
+            guard let self else { return }
+            self.suppressNextSubtitleSeek = true
+            self.clearSelectionContext()
+        }
+        view.onGlossSelected = { [weak self] cell, entry in
+            guard let self else { return }
+            let row = self.subtitleTable.row(for: cell)
+            self.showDetail(entry: entry, row: row, anchorView: cell, anchorRect: cell.bounds, resetBackStack: true)
+        }
+        view.onGlossRemoved = { [weak self] cell, entry in
+            guard let self else { return }
+            let row = self.subtitleTable.row(for: cell)
+            guard let segment = self.state.currentTranscript?.segments[safe: row] else { return }
+            self.state.removeGloss(id: entry.id, from: segment.id)
+        }
+        view.onGlossRetry = { [weak self] cell in
+            guard let self else { return }
+            let row = self.subtitleTable.row(for: cell)
+            guard let segment = self.state.currentTranscript?.segments[safe: row],
+                  let surface = self.state.retryableGlossSurface(for: segment.id) else { return }
+            self.state.retryGloss(surface: surface, in: segment.id)
+        }
+        view.onDraftChanged = { [weak self] cell, text in
+            guard let self,
+                  let target = self.editingState.target,
+                  target.videoID == self.state.currentVideoID,
+                  let segmentID = cell.representedSegmentID,
+                  segmentID == target.segmentID else { return }
+            self.subtitleDrafts.update(videoID: target.videoID, segmentID: segmentID, text: text)
+        }
+        view.onSaveTranslation = { [weak self] cell, text in
+            guard let self else { return }
+            guard let videoID = self.state.currentVideoID,
+                  let target = self.editingState.target,
+                  let segmentID = cell.representedSegmentID,
+                  target.videoID == videoID,
+                  target.segmentID == segmentID,
+                  self.state.currentTranscript?.segments.contains(where: { $0.id == segmentID }) == true else { return }
+            self.state.saveChineseOverride(for: segmentID, text: text, videoID: videoID)
+            self.subtitleDrafts.remove(videoID: videoID, segmentID: segmentID)
+            self.editingState.end()
+            self.reloadSubtitleRows(for: [segmentID])
+        }
+        view.onCancelTranslation = { [weak self] cell in
+            guard let self,
+                  let target = self.editingState.target,
+                  let segmentID = cell.representedSegmentID,
+                  target.videoID == self.state.currentVideoID,
+                  segmentID == target.segmentID else { return }
+            self.subtitleDrafts.remove(videoID: target.videoID, segmentID: segmentID)
+            self.editingState.end()
+            self.reloadSubtitleRows(for: [segmentID])
+        }
+        view.configure(
+            segment,
+            videoID: state.currentVideoID,
+            mode: mode,
+            current: row == currentSubtitleRow,
+            editing: isEditing(segmentID: segment.id),
+            draft: state.currentVideoID.flatMap { subtitleDrafts.value(videoID: $0, segmentID: segment.id) },
+            glossState: state.glossState(for: segment.id)
+        )
         return view
     }
 
@@ -662,8 +825,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             if showingHiddenVideos { return }
             state.selectVideo(video.id)
         } else if table === subtitleTable, let segment = state.currentTranscript?.segments[safe: table.selectedRow] {
-            playerView.seek(to: segment.start)
-            state.updatePlaybackTime(segment.start)
+            if suppressNextSubtitleSeek || selectionPresenter.isShown {
+                suppressNextSubtitleSeek = false
+                return
+            }
+            _ = segment
+            seekSubtitleRow(table.selectedRow)
         }
     }
 
@@ -769,9 +936,290 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     @objc private func backFive() { playerView.skip(by: -5) }
     @objc private func forwardFive() { playerView.skip(by: 5) }
     @objc private func retryTranscript() { state.retryTranscript() }
+
+    private func presentSelection(
+        textView: SelectableEnglishTextView,
+        surface: String,
+        rect: NSRect
+    ) {
+        guard let videoID = textView.representedVideoID,
+              let segmentID = textView.representedSegmentID,
+              state.currentVideoID == videoID,
+              state.currentTranscript?.segments.contains(where: { $0.id == segmentID }) == true,
+              VocabularyNormalization.isEligibleSurface(surface) else { return }
+        let context = VocabularySelectionContext(videoID: videoID, segmentID: segmentID, surface: surface, textView: textView, rect: rect)
+        selectionContext = context
+        DispatchQueue.main.async { [weak self] in self?.suppressNextSubtitleSeek = false }
+        selectionPresenter.present(
+            for: textView,
+            surface: surface,
+            rect: rect,
+            allowsDetail: true,
+            onGloss: { [weak self] in _ = self?.performGloss(context: context) },
+            onDetail: { [weak self] in _ = self?.performDetail(context: context) }
+        )
+    }
+
+    private func performGlossShortcut() -> Bool {
+        guard let context = selectionContext,
+              let videoID = state.currentVideoID,
+              context.isValid(
+                currentVideoID: videoID,
+                currentSegmentID: context.segmentID,
+                currentSurface: context.surface
+              ) else { return false }
+        return performGloss(context: context)
+    }
+
+    private func performDetailShortcut() -> Bool {
+        guard let context = selectionContext,
+              let videoID = state.currentVideoID,
+              context.isValid(
+                currentVideoID: videoID,
+                currentSegmentID: context.segmentID,
+                currentSurface: context.surface
+              ) else { return false }
+        return performDetail(context: context)
+    }
+
+    private func performGloss(context: VocabularySelectionContext) -> Bool {
+        guard let videoID = state.currentVideoID,
+              context.isValid(
+                currentVideoID: videoID,
+                currentSegmentID: context.segmentID,
+                currentSurface: context.surface
+              ),
+              state.currentTranscript?.segments.contains(where: { $0.id == context.segmentID }) == true else { return false }
+        selectionPresenter.close()
+        state.lookupGloss(surface: context.surface, segmentID: context.segmentID, videoID: videoID)
+        return true
+    }
+
+    @discardableResult
+    private func performGloss(
+        textView: SelectableEnglishTextView,
+        surface: String,
+        videoID: String,
+        segmentID: String
+    ) -> Bool {
+        guard state.currentVideoID == videoID,
+              textView.representedVideoID == videoID,
+              textView.representedSegmentID == segmentID,
+              state.currentTranscript?.segments.contains(where: { $0.id == segmentID }) == true else { return false }
+        let context = VocabularySelectionContext(
+            videoID: videoID,
+            segmentID: segmentID,
+            surface: surface,
+            textView: textView,
+            rect: textView.selectionRectInViewCoordinates
+        )
+        guard context.isValid(
+            currentVideoID: videoID,
+            currentSegmentID: segmentID,
+            currentSurface: surface
+        ) else { return false }
+        selectionContext = context
+        DispatchQueue.main.async { [weak self] in self?.suppressNextSubtitleSeek = false }
+        selectionPresenter.close()
+        state.lookupGloss(surface: surface, segmentID: segmentID, videoID: videoID)
+        return true
+    }
+
+    private func performDetail(context: VocabularySelectionContext) -> Bool {
+        guard let videoID = state.currentVideoID,
+              let textView = context.textView,
+              context.isValid(
+                currentVideoID: videoID,
+                currentSegmentID: context.segmentID,
+                currentSurface: context.surface
+              ),
+              let row = state.currentTranscript?.segments.firstIndex(where: { $0.id == context.segmentID }) else { return false }
+        selectionPresenter.close()
+        let segment = state.currentTranscript!.segments[row]
+        let entry = segment.glosses.first(where: { $0.normalized == VocabularyNormalization.normalizedTerm(context.surface) })
+            ?? GlossEntry(surface: context.surface, gloss: "", detailCacheKey: VocabDetailCacheKey.make(normalizedTerm: context.surface, videoID: videoID, subtitleID: segment.id))
+        showDetail(entry: entry, row: row, anchorView: textView, anchorRect: context.rect, resetBackStack: true)
+        return true
+    }
+
+    private func clearSelectionContext() {
+        selectionContext = nil
+        selectionPresenter.close()
+    }
+
+    private func clearDetailPresentation() {
+        detailPopover.close()
+        visibleDetailContext = nil
+        visibleDetailIdentity = nil
+        detailBackStack.removeAll()
+    }
+
+    private func showDetail(for summary: VocabularySummaryEntry) {
+        guard summary.videoID == state.currentVideoID,
+              let row = state.currentTranscript?.segments.firstIndex(where: { $0.id == summary.segmentID }) else { return }
+        showDetail(entry: summary.gloss, row: row, anchorView: vocabularyPanel, anchorRect: vocabularyPanel.bounds, resetBackStack: true)
+    }
+
+    private func showDetail(
+        entry: GlossEntry,
+        row: Int,
+        anchorView: NSView,
+        anchorRect: NSRect,
+        resetBackStack: Bool
+    ) {
+        guard let videoID = state.currentVideoID,
+              let segment = state.currentTranscript?.segments[safe: row] else { return }
+        if resetBackStack { detailBackStack.removeAll() }
+        let context = DetailContext(entry: entry, segmentID: segment.id, videoID: videoID, anchorView: anchorView, anchorRect: anchorRect)
+        let identity = VocabDetailRequestIdentity(
+            videoID: videoID,
+            segmentID: segment.id,
+            normalized: entry.normalized,
+            presentationID: UUID(),
+            requestID: UUID()
+        )
+        visibleDetailContext = context
+        visibleDetailIdentity = identity
+        let cached = state.cachedVocabDetail(for: entry, segmentID: segment.id, videoID: videoID)
+        detailPopover.show(
+            entry: entry,
+            detail: cached,
+            state: cached == nil ? .loading : .idle,
+            relativeTo: anchorRect,
+            of: anchorView,
+            canGoBack: !detailBackStack.isEmpty
+        )
+        state.lookupDetail(for: entry, in: segment.id, videoID: videoID) { [weak self] result in
+            guard let self,
+                  self.visibleDetailIdentity == identity,
+                  self.visibleDetailContext?.videoID == videoID,
+                  self.visibleDetailContext?.segmentID == segment.id,
+                  self.visibleDetailContext?.entry.normalized == entry.normalized else { return }
+            switch result {
+            case .success(let detail):
+                self.detailPopover.detailContentView.render(entry: entry, detail: detail, state: .idle, canGoBack: !self.detailBackStack.isEmpty)
+            case .failure(let error):
+                self.detailPopover.detailContentView.render(entry: entry, detail: nil, state: .failed(error.localizedDescription), canGoBack: !self.detailBackStack.isEmpty)
+            }
+        }
+    }
+
+    private func retryVisibleDetail() {
+        guard let context = visibleDetailContext else { return }
+        let identity = VocabDetailRequestIdentity(
+            videoID: context.videoID,
+            segmentID: context.segmentID,
+            normalized: context.entry.normalized,
+            presentationID: visibleDetailIdentity?.presentationID ?? UUID(),
+            requestID: UUID()
+        )
+        visibleDetailIdentity = identity
+        detailPopover.detailContentView.render(entry: context.entry, detail: nil, state: .loading, canGoBack: !detailBackStack.isEmpty)
+        state.retryDetail(for: context.entry, in: context.segmentID, videoID: context.videoID) { [weak self] result in
+            guard let self,
+                  self.visibleDetailIdentity == identity,
+                  self.visibleDetailContext?.videoID == context.videoID,
+                  self.visibleDetailContext?.segmentID == context.segmentID,
+                  self.visibleDetailContext?.entry.normalized == context.entry.normalized else { return }
+            switch result {
+            case .success(let detail): self.detailPopover.detailContentView.render(entry: context.entry, detail: detail, state: .idle, canGoBack: !self.detailBackStack.isEmpty)
+            case .failure(let error): self.detailPopover.detailContentView.render(entry: context.entry, detail: nil, state: .failed(error.localizedDescription), canGoBack: !self.detailBackStack.isEmpty)
+            }
+        }
+    }
+
+    private func lookupRelatedWord(_ related: VocabRelatedWord) {
+        guard let current = visibleDetailContext else { return }
+        detailBackStack.append(current)
+        let entry = GlossEntry(
+            surface: related.word,
+            normalized: VocabularyNormalization.normalizedTerm(related.word),
+            gloss: related.translation ?? "",
+            pos: related.pos,
+            detailCacheKey: VocabDetailCacheKey.make(normalizedTerm: related.word, videoID: current.videoID, subtitleID: current.segmentID)
+        )
+        showDetail(entry: entry, row: state.currentTranscript?.segments.firstIndex(where: { $0.id == current.segmentID }) ?? 0, anchorView: current.anchorView, anchorRect: current.anchorRect, resetBackStack: false)
+    }
+
+    private func goBackDetail() {
+        guard let previous = detailBackStack.popLast(),
+              let row = state.currentTranscript?.segments.firstIndex(where: { $0.id == previous.segmentID }) else { return }
+        showDetail(entry: previous.entry, row: row, anchorView: previous.anchorView, anchorRect: previous.anchorRect, resetBackStack: false)
+    }
+
+    @objc private func showVocabulary() {
+        guard state.currentTranscript != nil else { return }
+        if subtitleCollapsed { setSubtitlesCollapsed(false) }
+        if !backgroundCardPanel.isHidden { hideBackgroundCard() }
+        vocabularyPanel.alphaValue = 0
+        vocabularyPanel.isHidden = false
+        vocabularyPanel.render(video: state.currentVideo, entries: state.currentVocabularyEntries)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            vocabularyPanel.animator().alphaValue = 1
+        }
+    }
+
+    private func hideVocabulary() {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.12
+            vocabularyPanel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            self?.vocabularyPanel.isHidden = true
+            self?.vocabularyPanel.alphaValue = 1
+        })
+    }
+
+    private func seekSubtitleRow(_ row: Int) {
+        guard let segment = state.currentTranscript?.segments[safe: row] else { return }
+        suppressNextSubtitleSeek = false
+        clearSelectionContext()
+        playerView.seek(to: segment.start)
+        state.updatePlaybackTime(segment.start)
+    }
+
+    @objc private func editClickedSubtitle() {
+        let row = subtitleTable.clickedRow
+        guard let videoID = state.currentVideoID,
+              row >= 0,
+              let segment = state.currentTranscript?.segments[safe: row] else { return }
+        let nextTarget = SubtitleEditingTarget(videoID: videoID, segmentID: segment.id)
+        let previousSegmentID = editingState.target?.videoID == videoID ? editingState.target?.segmentID : nil
+        if editingState.target != nextTarget {
+            clearEditingDraft()
+            editingState.begin(videoID: videoID, segmentID: segment.id)
+            subtitleDrafts.update(videoID: videoID, segmentID: segment.id, text: segment.effectiveTranslation ?? "")
+            reloadSubtitleRows(for: [previousSegmentID, segment.id].compactMap { $0 })
+        } else {
+            reloadSubtitleRows(for: [segment.id])
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let cell = self.subtitleTable.view(atColumn: 0, row: row, makeIfNecessary: false) as? SubtitleCell else { return }
+            cell.focusEditor()
+        }
+    }
+
+    private func isEditing(segmentID: String) -> Bool {
+        guard let videoID = state.currentVideoID else { return false }
+        return editingState.isEditing(videoID: videoID, segmentID: segmentID)
+    }
+
+    private func clearEditingDraft() {
+        if let target = editingState.target {
+            subtitleDrafts.remove(videoID: target.videoID, segmentID: target.segmentID)
+        }
+        editingState.end()
+    }
+
+    @objc private func lookupSelectedWordFromMenu() {
+        guard let context = selectionContext else { return }
+        _ = performGloss(context: context)
+    }
+
     @objc private func showBackgroundCard() {
         guard state.currentTranscript != nil else { return }
         if subtitleCollapsed { setSubtitlesCollapsed(false) }
+        if !vocabularyPanel.isHidden { hideVocabulary() }
         backgroundCardPanel.alphaValue = 0
         backgroundCardPanel.isHidden = false
         backgroundCardPanel.render(
@@ -854,7 +1302,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "全部重新翻译？"
-        alert.informativeText = "将清除当前 \(count) 句的中文翻译并重新调用翻译服务。原英文字幕不会改变。"
+        alert.informativeText = "将清除当前 \(count) 句的中文翻译和手动编辑，并重新调用翻译服务。原英文字幕不会改变。"
         alert.addButton(withTitle: "全部重新翻译")
         alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in
@@ -886,9 +1334,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             let row = subtitleTable.clickedRow
             item.isEnabled = row >= 0
             if row >= 0, let segment = state.currentTranscript?.segments[safe: row] {
-                item.title = segment.translation?.isEmpty == false ? "重新翻译此句" : "补翻此句"
+                item.title = segment.hasEffectiveTranslation ? "重新翻译此句" : "补翻此句"
             } else {
                 item.title = "补翻 / 重试此句"
+            }
+            if menu.items.count > 1 {
+                menu.items[1].isEnabled = row >= 0
+            }
+            if menu.items.count > 2 {
+                menu.items[2].isEnabled = row >= 0
+                    && selectionContext?.videoID == state.currentVideoID
+                    && selectionContext?.segmentID == state.currentTranscript?.segments[safe: row]?.id
+                    && selectionContext?.surface.isEmpty == false
             }
         }
     }
@@ -908,7 +1365,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "删除“\(video.title)”？"
-        alert.informativeText = "将永久删除视频信息、原字幕、翻译结果和视频背景卡。此操作无法撤销。"
+        alert.informativeText = "将永久删除视频信息、原字幕、翻译结果、词汇注释与详解缓存和视频背景卡。此操作无法撤销。"
         alert.addButton(withTitle: "删除")
         alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in
@@ -1115,12 +1572,52 @@ private final class PlaylistCell: NSTableCellView {
     }
 }
 
+private final class SubtitleTranslationLabel: NSTextField {
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets() }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isEditable = false
+        isSelectable = false
+        isBordered = false
+        drawsBackground = false
+        backgroundColor = .clear
+        maximumNumberOfLines = 0
+        lineBreakMode = .byWordWrapping
+        cell?.wraps = true
+        cell?.isScrollable = false
+        cell?.usesSingleLineMode = false
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
 final class SubtitleCell: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("SubtitleCell")
     private let time = EchoStyle.label("", size: 9.5, color: EchoStyle.textTertiary)
-    private let original = EchoStyle.label("", size: 13, weight: .medium, lines: 0)
-    private let translation = EchoStyle.label("", size: 12, color: EchoStyle.textSecondary, lines: 0)
+    private let original = SelectableEnglishTextView(frame: .zero)
+    private let translation = SubtitleTranslationLabel(frame: .zero)
+    private let editedBadge = EchoStyle.label("已编辑", size: 9.5, weight: .medium, color: EchoStyle.textTertiary)
+    private let glosses = GlossInlineView()
+    private let editor = InlineTranslationEditor(value: "")
     private let bar = NSView()
+
+    var representedSegmentID: String?
+
+    var onSelectionToolbar: ((SubtitleCell, SelectableEnglishTextView, String, NSRect) -> Void)?
+    var onDoubleClickGloss: ((SubtitleCell, SelectableEnglishTextView, String) -> Void)?
+    var onContextualGloss: ((SubtitleCell, SelectableEnglishTextView, String) -> Void)?
+    var onPlainEnglishClick: ((SubtitleCell) -> Void)?
+    var onTextInteractionBegan: (() -> Void)?
+    var onGlossSelected: ((SubtitleCell, GlossEntry) -> Void)?
+    var onGlossRemoved: ((SubtitleCell, GlossEntry) -> Void)?
+    var onGlossRetry: ((SubtitleCell) -> Void)?
+    var onSaveTranslation: ((SubtitleCell, String) -> Void)?
+    var onCancelTranslation: ((SubtitleCell) -> Void)?
+    var onDraftChanged: ((SubtitleCell, String) -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1129,9 +1626,9 @@ final class SubtitleCell: NSTableCellView {
         bar.wantsLayer = true
         bar.layer?.backgroundColor = EchoStyle.accent.cgColor
         bar.translatesAutoresizingMaskIntoConstraints = false
-        let texts = NSStackView(views: [original, translation])
+        let texts = NSStackView(views: [original, translation, editedBadge, glosses, editor])
         texts.orientation = .vertical
-        texts.alignment = .leading
+        texts.alignment = .width
         texts.spacing = 5
         texts.translatesAutoresizingMaskIntoConstraints = false
         addSubview(bar)
@@ -1140,6 +1637,53 @@ final class SubtitleCell: NSTableCellView {
         time.alignment = .left
         original.alignment = .left
         translation.alignment = .left
+        original.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        original.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        editedBadge.alignment = .left
+        glosses.isHidden = true
+        editedBadge.isHidden = true
+        editor.isHidden = true
+        original.onSelectionToolbar = { [weak self] textView, surface, rect in
+            guard let self else { return }
+            self.onSelectionToolbar?(self, textView, surface, rect)
+        }
+        original.onDoubleClickGloss = { [weak self] textView, surface in
+            guard let self else { return }
+            self.onDoubleClickGloss?(self, textView, surface)
+        }
+        original.onContextualGloss = { [weak self] textView, surface in
+            guard let self else { return }
+            self.onContextualGloss?(self, textView, surface)
+        }
+        original.onPlainClick = { [weak self] in
+            guard let self else { return }
+            self.onPlainEnglishClick?(self)
+        }
+        original.onInteractionBegan = { [weak self] in self?.onTextInteractionBegan?() }
+        glosses.onSelect = { [weak self] entry in
+            guard let self else { return }
+            self.onGlossSelected?(self, entry)
+        }
+        glosses.onRemove = { [weak self] entry in
+            guard let self else { return }
+            self.onGlossRemoved?(self, entry)
+        }
+        glosses.onRetry = { [weak self] in
+            guard let self else { return }
+            self.onGlossRetry?(self)
+        }
+        editor.onSave = { [weak self] text in
+            guard let self else { return }
+            self.onSaveTranslation?(self, text)
+        }
+        editor.onCancel = { [weak self] in
+            guard let self else { return }
+            self.onCancelTranslation?(self)
+        }
+        editor.onTextChange = { [weak self] text in
+            guard let self else { return }
+            self.onDraftChanged?(self, text)
+        }
         NSLayoutConstraint.activate([
             bar.leadingAnchor.constraint(equalTo: leadingAnchor),
             bar.topAnchor.constraint(equalTo: topAnchor),
@@ -1152,8 +1696,16 @@ final class SubtitleCell: NSTableCellView {
             texts.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             texts.topAnchor.constraint(equalTo: topAnchor, constant: 9),
             texts.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -8),
-            original.widthAnchor.constraint(equalTo: texts.widthAnchor),
-            translation.widthAnchor.constraint(equalTo: texts.widthAnchor),
+            original.leadingAnchor.constraint(equalTo: texts.leadingAnchor),
+            original.trailingAnchor.constraint(equalTo: texts.trailingAnchor),
+            translation.leadingAnchor.constraint(equalTo: texts.leadingAnchor),
+            translation.trailingAnchor.constraint(equalTo: texts.trailingAnchor),
+            editedBadge.leadingAnchor.constraint(equalTo: texts.leadingAnchor),
+            editedBadge.trailingAnchor.constraint(equalTo: texts.trailingAnchor),
+            glosses.leadingAnchor.constraint(equalTo: texts.leadingAnchor),
+            glosses.trailingAnchor.constraint(equalTo: texts.trailingAnchor),
+            editor.leadingAnchor.constraint(equalTo: texts.leadingAnchor),
+            editor.trailingAnchor.constraint(equalTo: texts.trailingAnchor),
         ])
     }
     required init?(coder: NSCoder) { nil }
@@ -1163,16 +1715,38 @@ final class SubtitleCell: NSTableCellView {
         return [original.frame, translation.frame]
     }
 
-    func configure(_ segment: SubtitleSegment, mode: SubtitleDisplayMode, current: Bool) {
+    var originalTextUsedHeight: CGFloat {
+        layoutSubtreeIfNeeded()
+        guard let layoutManager = original.layoutManager,
+              let textContainer = original.textContainer else { return 0 }
+        layoutManager.ensureLayout(for: textContainer)
+        return ceil(layoutManager.usedRect(for: textContainer).height)
+    }
+
+    var isEditorVisible: Bool { !editor.isHidden }
+    var editorText: String { editor.textView.string }
+
+    func configure(
+        _ segment: SubtitleSegment,
+        videoID: String? = nil,
+        mode: SubtitleDisplayMode,
+        current: Bool,
+        editing: Bool = false,
+        draft: String? = nil,
+        glossState: GlossLookupState = .idle
+    ) {
         let settings = AppSettings.shared
         time.stringValue = formattedTime(segment.start)
-        let translated = segment.translation ?? (mode == .original ? "" : "等待翻译…")
-        EchoStyle.applySubtitleText(
-            original,
+        segmentID = segment.id
+        representedSegmentID = segment.id
+        original.representedVideoID = videoID
+        original.representedSegmentID = segment.id
+        original.configure(
             text: segment.original,
             font: .systemFont(ofSize: 13, weight: .medium),
             color: settings.englishSubtitleColor
         )
+        let translated = segment.effectiveTranslation ?? (mode == .original ? "" : "等待翻译…")
         EchoStyle.applySubtitleText(
             translation,
             text: translated,
@@ -1180,10 +1754,22 @@ final class SubtitleCell: NSTableCellView {
             color: settings.chineseSubtitleColor
         )
         original.isHidden = mode == .translated
-        translation.isHidden = mode == .original
+        translation.isHidden = mode == .original || editing
+        editedBadge.isHidden = mode == .original || editing || segment.zhUserOverride?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+        glosses.entries = mode == .original ? [] : segment.glosses
+        glosses.state = mode == .original ? .idle : glossState
+        glosses.isHidden = editing || mode == .original || (segment.glosses.isEmpty && glossState == .idle)
+        editor.isHidden = !editing
+        if editing {
+            editor.textView.string = draft ?? segment.effectiveTranslation ?? ""
+        }
         layer?.backgroundColor = current ? EchoStyle.highlight.cgColor : NSColor.clear.cgColor
         bar.isHidden = !current
     }
+
+    private var segmentID: String?
+
+    func focusEditor() { editor.focus() }
 }
 
 private final class PlayerWindowOverlay: NSView {

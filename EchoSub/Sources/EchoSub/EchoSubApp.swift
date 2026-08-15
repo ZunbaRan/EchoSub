@@ -30,7 +30,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: .echoToggleFloatingWindow, object: nil, queue: .main) { [weak self] _ in self?.toggleFloatingWindow() })
         observers.append(center.addObserver(forName: .echoToggleLyricsWindow, object: nil, queue: .main) { [weak self] _ in self?.toggleLyricsWindow() })
-        observers.append(center.addObserver(forName: .echoOpenSettings, object: nil, queue: .main) { [weak self] _ in self?.showSettings() })
+        observers.append(center.addObserver(forName: .echoOpenSettings, object: nil, queue: .main) { [weak self] note in
+            self?.showSettings(target: SettingsPresentationPolicy.target(from: note.userInfo))
+        })
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -129,9 +131,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showSettings() {
+        showSettings(target: .defaultTab)
+    }
+
+    private func showSettings(target: SettingsPresentationTarget) {
         let controller = settingsWindowController ?? SettingsWindowController()
         settingsWindowController = controller
         controller.showWindow(nil)
+        if target == .translation {
+            controller.showTranslationSettings()
+        }
         controller.window?.center()
         controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

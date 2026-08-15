@@ -13,9 +13,12 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     private var currentRow = -1
     private var isProgrammaticScroll = false
     private var observers: [NSObjectProtocol] = []
+    private let selectionPresenter = SelectionActionPresenter.shared
+    private var selectionContext: VocabularySelectionContext?
+    private var suppressNextSubtitleSeek = false
 
     init() {
-        let panel = NSPanel(
+        let panel = VocabularyFloatingPanel(
             contentRect: NSRect(x: 0, y: 0, width: 470, height: 320),
             styleMask: [.titled, .closable, .resizable, .utilityWindow, .fullSizeContentView],
             backing: .buffered,
@@ -34,6 +37,7 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         panel.isFloatingPanel = true
         panel.setFrameAutosaveName("EchoSub.floating.v2")
         super.init(window: panel)
+        panel.onGlossShortcut = { [weak self] in self?.performFloatingGlossShortcut() ?? false }
         panel.delegate = self
         buildInterface()
         setPinned(settings.floatPinned)
@@ -139,9 +143,13 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     private func bindState() {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: .echoTranscriptChanged, object: nil, queue: .main) { [weak self] _ in self?.reload() })
-        observers.append(center.addObserver(forName: .echoCurrentVideoChanged, object: nil, queue: .main) { [weak self] _ in self?.reload() })
+        observers.append(center.addObserver(forName: .echoCurrentVideoChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.clearSelectionContext()
+            self?.reload()
+        })
         observers.append(center.addObserver(forName: .echoPlaybackTimeChanged, object: nil, queue: .main) { [weak self] _ in self?.updateCurrentRow() })
         observers.append(center.addObserver(forName: .echoSettingsChanged, object: nil, queue: .main) { [weak self] _ in self?.applySettings() })
+        observers.append(center.addObserver(forName: .echoVocabularyChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshVocabularyRows() })
     }
 
     private func reload() { currentRow = -1; table.reloadData(); updateCurrentRow() }
@@ -217,7 +225,8 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
             for: segment,
             mode: mode,
             availableWidth: table.bounds.width - 28,
-            fontSize: CGFloat(settings.overlayFontSize)
+            fontSize: CGFloat(settings.overlayFontSize),
+            glossState: state.glossState(for: segment.id)
         )
     }
 
@@ -227,18 +236,141 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         table.reloadData()
     }
 
+    private func refreshVocabularyRows() {
+        refreshRowHeights()
+        updateCurrentRow()
+    }
+
+    private func presentFloatingSelection(textView: SelectableEnglishTextView, surface: String, rect: NSRect, segmentID: String) {
+        guard let videoID = state.currentVideoID,
+              state.currentTranscript?.segments.contains(where: { $0.id == segmentID }) == true,
+              VocabularyNormalization.isEligibleSurface(surface) else { return }
+        let context = VocabularySelectionContext(videoID: videoID, segmentID: segmentID, surface: surface, textView: textView, rect: rect)
+        selectionContext = context
+        DispatchQueue.main.async { [weak self] in self?.suppressNextSubtitleSeek = false }
+        selectionPresenter.present(
+            for: textView,
+            surface: surface,
+            rect: rect,
+            allowsDetail: false,
+            onGloss: { [weak self] in _ = self?.performFloatingGloss(context: context) }
+        )
+    }
+
+    private func performFloatingGlossShortcut() -> Bool {
+        guard let context = selectionContext,
+              let videoID = state.currentVideoID,
+              context.isValid(
+                currentVideoID: videoID,
+                currentSegmentID: context.segmentID,
+                currentSurface: context.surface
+              ) else { return false }
+        return performFloatingGloss(context: context)
+    }
+
+    @discardableResult
+    private func performFloatingGloss(textView: SelectableEnglishTextView, surface: String, segmentID: String) -> Bool {
+        guard let videoID = state.currentVideoID,
+              state.currentTranscript?.segments.contains(where: { $0.id == segmentID }) == true else { return false }
+        let context = VocabularySelectionContext(
+            videoID: videoID,
+            segmentID: segmentID,
+            surface: surface,
+            textView: textView,
+            rect: textView.selectionRectInViewCoordinates
+        )
+        guard context.isValid(
+            currentVideoID: videoID,
+            currentSegmentID: segmentID,
+            currentSurface: surface
+        ) else { return false }
+        selectionContext = context
+        DispatchQueue.main.async { [weak self] in self?.suppressNextSubtitleSeek = false }
+        selectionPresenter.close()
+        state.lookupGloss(surface: surface, segmentID: segmentID, videoID: videoID)
+        return true
+    }
+
+    private func performFloatingGloss(context: VocabularySelectionContext) -> Bool {
+        guard let videoID = state.currentVideoID,
+              context.isValid(
+                currentVideoID: videoID,
+                currentSegmentID: context.segmentID,
+                currentSurface: context.surface
+              ),
+              state.currentTranscript?.segments.contains(where: { $0.id == context.segmentID }) == true else { return false }
+        selectionPresenter.close()
+        state.lookupGloss(surface: context.surface, segmentID: context.segmentID, videoID: videoID)
+        return true
+    }
+
+    private func seekFloatingRow(_ row: Int) {
+        guard let segment = state.currentTranscript?.segments[safeOverlay: row] else { return }
+        suppressNextSubtitleSeek = false
+        clearSelectionContext()
+        NotificationCenter.default.post(name: .echoSeekRequested, object: segment.start)
+        state.updatePlaybackTime(segment.start)
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard let segment = state.currentTranscript?.segments[safeOverlay: row] else { return nil }
         let cell = tableView.makeView(withIdentifier: FloatingCell.identifier, owner: self) as? FloatingCell ?? FloatingCell()
         let mode = SubtitleDisplayMode(rawValue: modeControl.selectedSegment) ?? .bilingual
-        cell.configure(segment, mode: mode, current: row == currentRow, fontSize: CGFloat(settings.overlayFontSize))
+        cell.onSelectionToolbar = { [weak self] cell, textView, surface, rect in
+            guard let segmentID = cell.representedSegmentID else { return }
+            self?.presentFloatingSelection(textView: textView, surface: surface, rect: rect, segmentID: segmentID)
+        }
+        cell.onDoubleClickGloss = { [weak self] cell, textView, surface in
+            guard let segmentID = cell.representedSegmentID else { return }
+            _ = self?.performFloatingGloss(textView: textView, surface: surface, segmentID: segmentID)
+        }
+        cell.onPlainEnglishClick = { [weak self] in
+            guard let self else { return }
+            let selectedRow = self.table.row(for: cell)
+            guard selectedRow >= 0 else { return }
+            self.seekFloatingRow(selectedRow)
+        }
+        cell.onTextInteractionBegan = { [weak self] in
+            guard let self else { return }
+            self.suppressNextSubtitleSeek = true
+            self.clearSelectionContext()
+        }
+        cell.onGlossRemoved = { [weak self] entry in
+            guard let self else { return }
+            let selectedRow = self.table.row(for: cell)
+            guard let segment = self.state.currentTranscript?.segments[safeOverlay: selectedRow] else { return }
+            self.state.removeGloss(id: entry.id, from: segment.id)
+        }
+        cell.onGlossRetry = { [weak self] in
+            guard let self else { return }
+            let selectedRow = self.table.row(for: cell)
+            guard let segment = self.state.currentTranscript?.segments[safeOverlay: selectedRow],
+                  let surface = self.state.retryableGlossSurface(for: segment.id) else { return }
+            self.state.retryGloss(surface: surface, in: segment.id)
+        }
+        cell.configure(
+            segment,
+            mode: mode,
+            current: row == currentRow,
+            fontSize: CGFloat(settings.overlayFontSize),
+            glossState: state.glossState(for: segment.id)
+        )
         return cell
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard table.selectedRow >= 0, let segment = state.currentTranscript?.segments[safeOverlay: table.selectedRow] else { return }
-        NotificationCenter.default.post(name: .echoSeekRequested, object: segment.start)
-        state.updatePlaybackTime(segment.start)
+        if suppressNextSubtitleSeek || selectionPresenter.isShown {
+            suppressNextSubtitleSeek = false
+            return
+        }
+        _ = segment
+        seekFloatingRow(table.selectedRow)
+    }
+
+    private func clearSelectionContext() {
+        selectionContext = nil
+        selectionPresenter.close()
     }
 
     @objc private func togglePin() {
@@ -266,7 +398,7 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         let row = table.clickedRow
         item.isEnabled = row >= 0
         if row >= 0, let segment = state.currentTranscript?.segments[safeOverlay: row] {
-            item.title = segment.translation?.isEmpty == false ? "重新翻译此句" : "补翻此句"
+            item.title = segment.hasEffectiveTranslation ? "重新翻译此句" : "补翻此句"
         }
     }
 
@@ -280,10 +412,19 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     }
 }
 
-private final class FloatingCell: NSTableCellView {
+final class FloatingCell: NSTableCellView {
     static let identifier = NSUserInterfaceItemIdentifier("FloatingCell")
-    private let original = EchoStyle.label("", size: 16, weight: .semibold, lines: 0)
+    private let original = SelectableEnglishTextView(frame: .zero)
     private let translation = EchoStyle.label("", size: 13, color: EchoStyle.textSecondary, lines: 0)
+    private let glosses = GlossInlineView()
+
+    var representedSegmentID: String?
+    var onSelectionToolbar: ((FloatingCell, SelectableEnglishTextView, String, NSRect) -> Void)?
+    var onDoubleClickGloss: ((FloatingCell, SelectableEnglishTextView, String) -> Void)?
+    var onPlainEnglishClick: (() -> Void)?
+    var onTextInteractionBegan: (() -> Void)?
+    var onGlossRemoved: ((GlossEntry) -> Void)?
+    var onGlossRetry: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -291,7 +432,7 @@ private final class FloatingCell: NSTableCellView {
         wantsLayer = true
         layer?.cornerRadius = 7
         layer?.masksToBounds = true
-        let stack = NSStackView(views: [original, translation])
+        let stack = NSStackView(views: [original, translation, glosses])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 5
@@ -300,20 +441,40 @@ private final class FloatingCell: NSTableCellView {
         stack.pinEdges(to: self, insets: NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12))
         original.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         translation.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        glosses.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         original.setContentCompressionResistancePriority(.required, for: .vertical)
         translation.setContentCompressionResistancePriority(.required, for: .vertical)
         original.alignment = .left
         translation.alignment = .left
+        glosses.isHidden = true
+        original.onSelectionToolbar = { [weak self] textView, surface, rect in
+            guard let self else { return }
+            self.onSelectionToolbar?(self, textView, surface, rect)
+        }
+        original.onDoubleClickGloss = { [weak self] textView, surface in
+            guard let self else { return }
+            self.onDoubleClickGloss?(self, textView, surface)
+        }
+        original.onPlainClick = { [weak self] in self?.onPlainEnglishClick?() }
+        original.onInteractionBegan = { [weak self] in self?.onTextInteractionBegan?() }
+        glosses.onRemove = { [weak self] entry in self?.onGlossRemoved?(entry) }
+        glosses.onRetry = { [weak self] in self?.onGlossRetry?() }
     }
     required init?(coder: NSCoder) { nil }
 
-    func configure(_ segment: SubtitleSegment, mode: SubtitleDisplayMode, current: Bool, fontSize: CGFloat) {
+    func configure(
+        _ segment: SubtitleSegment,
+        mode: SubtitleDisplayMode,
+        current: Bool,
+        fontSize: CGFloat,
+        glossState: GlossLookupState = .idle
+    ) {
+        representedSegmentID = segment.id
         let settings = AppSettings.shared
-        let translated = segment.translation ?? "等待翻译…"
+        let translated = segment.effectiveTranslation ?? "等待翻译…"
         original.isHidden = mode == .translated
         translation.isHidden = mode == .original
-        EchoStyle.applySubtitleText(
-            original,
+        original.configure(
             text: segment.original,
             font: .systemFont(ofSize: fontSize, weight: current ? .semibold : .regular),
             color: settings.englishSubtitleColor,
@@ -326,6 +487,10 @@ private final class FloatingCell: NSTableCellView {
             color: settings.chineseSubtitleColor,
             alpha: current ? 1 : 0.72
         )
+        glosses.fontSize = max(10, fontSize - 6)
+        glosses.entries = mode == .original ? [] : segment.glosses
+        glosses.state = mode == .original ? .idle : glossState
+        glosses.isHidden = mode == .original || (segment.glosses.isEmpty && glossState == .idle)
         layer?.backgroundColor = current ? EchoStyle.highlight.cgColor : NSColor.clear.cgColor
     }
 }
@@ -501,7 +666,7 @@ final class DesktopLyricsWindowController: NSWindowController, NSWindowDelegate 
             resizeHeightForContent()
             return
         }
-        applyStyledText(originalText: segment.original, translatedText: segment.translation ?? "")
+        applyStyledText(originalText: segment.original, translatedText: segment.effectiveTranslation ?? "")
         resizeHeightForContent()
     }
 

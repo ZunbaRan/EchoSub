@@ -60,6 +60,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTa
 
     required init?(coder: NSCoder) { nil }
 
+    func showTranslationSettings() {
+        let row = Tab.translation.rawValue
+        if table.selectedRow != row {
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        if selectedTab != .translation {
+            showTab(.translation)
+        }
+    }
+
     private func buildInterface() {
         guard let root = window?.contentView else { return }
         root.wantsLayer = true
