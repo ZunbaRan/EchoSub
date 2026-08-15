@@ -366,6 +366,28 @@ enum PlaybackQueue {
 #if canImport(AppKit)
 import AppKit
 
+enum SubtitleTextMetrics {
+    static func selectableTextHeight(_ text: String, font: NSFont, width: CGFloat) -> CGFloat {
+        let storage = NSTextStorage(attributedString: NSAttributedString(string: text, attributes: [.font: font]))
+        let layoutManager = NSLayoutManager()
+        let container = NSTextContainer(containerSize: NSSize(width: max(1, width), height: .greatestFiniteMagnitude))
+        container.widthTracksTextView = true
+        container.lineFragmentPadding = 0
+        layoutManager.addTextContainer(container)
+        storage.addLayoutManager(layoutManager)
+        layoutManager.ensureLayout(for: container)
+        let lineHeight = (font.capHeight) + font.leading + 4
+        return max(lineHeight, ceil(layoutManager.usedRect(for: container).height))
+    }
+
+    static func labelHeight(_ text: String, font: NSFont, width: CGFloat) -> CGFloat {
+        ceil(NSAttributedString(string: text, attributes: [.font: font]).boundingRect(
+            with: NSSize(width: max(1, width), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height)
+    }
+}
+
 enum FloatingSubtitleLayout {
     static func rowHeight(
         for segment: SubtitleSegment,
@@ -379,19 +401,20 @@ enum FloatingSubtitleLayout {
         // subtitle uses semibold, which can wrap one line earlier than regular.
         let originalFont = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
         let translatedFont = NSFont.systemFont(ofSize: max(11, fontSize - 3))
-        func textHeight(_ text: String, font: NSFont) -> CGFloat {
-            ceil(NSAttributedString(string: text, attributes: [.font: font]).boundingRect(
-                with: NSSize(width: width, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading]
-            ).height)
-        }
         var height: CGFloat = 16
-        if mode != .translated { height += textHeight(segment.original, font: originalFont) }
+        if mode != .translated {
+            height += SubtitleTextMetrics.selectableTextHeight(segment.original, font: originalFont, width: width)
+        }
         if mode == .bilingual { height += 5 }
-        if mode != .original { height += textHeight(segment.effectiveTranslation ?? "等待翻译…", font: translatedFont) }
+        if mode != .original {
+            height += SubtitleTextMetrics.labelHeight(segment.effectiveTranslation ?? "等待翻译…", font: translatedFont, width: width)
+        }
         if mode != .original, !segment.glosses.isEmpty {
-            let glossText = segment.glosses.map { "✨ \($0.surface) · \($0.gloss)" }.joined(separator: "  ┆  ")
-            height += 5 + textHeight(glossText, font: NSFont.systemFont(ofSize: max(10, fontSize - 6)))
+            height += 5 + GlossInlineView.measuredHeight(
+                entries: segment.glosses,
+                fontSize: max(10, fontSize - 6),
+                width: width
+            )
         }
         switch glossState {
         case .loading, .failed:
@@ -454,6 +477,58 @@ enum TranslationScope: Equatable {
     case missing
     case all
     case segment(String)
+}
+
+enum TranslationCueDiagnosticPhase: String, Equatable {
+    case queued
+    case requesting
+    case retrying
+    case succeeded
+    case failed
+
+    var label: String {
+        switch self {
+        case .queued: return "等待翻译"
+        case .requesting: return "正在请求"
+        case .retrying: return "等待重试"
+        case .succeeded: return "翻译成功"
+        case .failed: return "翻译失败"
+        }
+    }
+}
+
+struct TranslationCueDiagnostic: Equatable {
+    let videoID: String
+    let segmentID: String
+    var phase: TranslationCueDiagnosticPhase
+    var attempt: Int
+    var maximumAttempts: Int
+    var message: String
+    var requestID: String?
+    var updatedAt: Date
+
+    var menuTitle: String { "查看此句翻译状态（\(phase.label)）…" }
+
+    func detailText(for segment: SubtitleSegment) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let attemptDescription = attempt > 0 ? "\(attempt) / \(maximumAttempts)" : "尚未开始"
+        var lines = [
+            "状态：\(phase.label)",
+            "尝试：\(attemptDescription)",
+            "时间：\(formatter.string(from: updatedAt))",
+            "字幕 ID：\(segmentID)",
+        ]
+        if let requestID, !requestID.isEmpty { lines.append("请求 ID：\(requestID)") }
+        lines.append("说明：\(message)")
+        lines.append("原文：\(segment.original)")
+        if let translation = segment.effectiveTranslation, !translation.isEmpty {
+            lines.append("当前译文：\(translation)")
+        } else {
+            lines.append("当前译文：无")
+        }
+        return lines.joined(separator: "\n")
+    }
 }
 
 struct SubtitleDraftKey: Hashable {

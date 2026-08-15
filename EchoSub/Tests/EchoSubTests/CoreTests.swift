@@ -371,6 +371,111 @@ struct CoreTests {
         #expect(bilingual >= requiredHighlightedHeight)
     }
 
+    @Test("Floating active row never compresses an existing Chinese translation")
+    @MainActor
+    func floatingActiveRowKeepsTranslationVisible() {
+        let translation = "这绝不是某种疗法，也不是治愈手段。"
+        let segment = SubtitleSegment(
+            id: "current-wrap",
+            start: 0,
+            end: 4,
+            original: "ago, I was going through one of my bad bouts of depression and I came across this question, which is very simple, and",
+            translation: translation,
+            glosses: [GlossEntry(surface: "depression", gloss: "抑郁；低落状态")]
+        )
+        let actualCellWidth: CGFloat = 410
+        let fontSize: CGFloat = 18
+        let rowHeight = FloatingSubtitleLayout.rowHeight(
+            for: segment,
+            mode: .bilingual,
+            availableWidth: actualCellWidth - 24,
+            fontSize: fontSize
+        )
+        let cell = FloatingCell(frame: NSRect(x: 0, y: 0, width: actualCellWidth, height: rowHeight))
+
+        cell.configure(segment, mode: .bilingual, current: false, fontSize: fontSize)
+        cell.layoutSubtreeIfNeeded()
+        cell.configure(segment, mode: .bilingual, current: true, fontSize: fontSize)
+        cell.layoutSubtreeIfNeeded()
+
+        let translated = cell.descendants.compactMap { $0 as? NSTextField }.first { $0.stringValue == translation }
+        #expect(translated?.isHidden == false)
+        let visibleHeight = translated?.frame.height ?? 0
+        let requiredHeight = translated.map {
+            ceil($0.attributedStringValue.boundingRect(
+                with: NSSize(width: max(1, $0.frame.width), height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            ).height)
+        } ?? .greatestFiniteMagnitude
+        #expect(visibleHeight >= requiredHeight)
+        let original = cell.descendants.compactMap { $0 as? SelectableEnglishTextView }.first
+        let glosses = cell.descendants.compactMap { $0 as? GlossInlineView }.first
+        let exactRequiredHeight = 16
+            + (original?.intrinsicContentSize.height ?? 0)
+            + 5 + requiredHeight
+            + 5 + (glosses?.height(for: glosses?.bounds.width ?? 1) ?? 0)
+        #expect(rowHeight >= exactRequiredHeight)
+    }
+
+    @Test("Per-cue diagnostics explain the last translation outcome")
+    func translationCueDiagnosticExplainsOutcome() {
+        let segment = SubtitleSegment(
+            id: "segment-83-510040",
+            start: 510.04,
+            end: 514,
+            original: "and we live a life that is always in preparation for the future, and that",
+            translation: "我们过着一种永远在为未来做准备的生活，而"
+        )
+        let diagnostic = TranslationCueDiagnostic(
+            videoID: "video",
+            segmentID: segment.id,
+            phase: .succeeded,
+            attempt: 1,
+            maximumAttempts: 3,
+            message: "模型已返回并保存此句译文。",
+            requestID: "request-123",
+            updatedAt: Date(timeIntervalSince1970: 0)
+        )
+
+        #expect(diagnostic.menuTitle.contains("翻译成功"))
+        #expect(diagnostic.detailText(for: segment).contains("字幕 ID：segment-83-510040"))
+        #expect(diagnostic.detailText(for: segment).contains("当前译文：我们过着一种永远在为未来做准备的生活，而"))
+        #expect(diagnostic.detailText(for: segment).contains("请求 ID：request-123"))
+    }
+
+    @Test("Main subtitle row never compresses a translation after retry succeeds")
+    @MainActor
+    func mainSubtitleRowKeepsRetriedTranslationVisible() {
+        let translation = "我们过着一种永远在为未来做准备的生活，而那个时刻却迟迟没有到来。"
+        let segment = SubtitleSegment(
+            id: "retry-success",
+            start: 510,
+            end: 515,
+            original: "and we live a life that is always in preparation for the future, and that",
+            translation: translation
+        )
+        let tableWidth: CGFloat = 380
+        let rowHeight = SubtitleRowLayout.rowHeight(
+            for: segment,
+            mode: .bilingual,
+            availableWidth: tableWidth - 70
+        )
+        let cell = SubtitleCell(frame: NSRect(x: 0, y: 0, width: tableWidth, height: rowHeight))
+        cell.configure(segment, mode: .bilingual, current: true)
+        cell.layoutSubtreeIfNeeded()
+
+        let translated = cell.descendants.compactMap { $0 as? NSTextField }.first { $0.stringValue == translation }
+        #expect(translated?.isHidden == false)
+        let visibleHeight = translated?.frame.height ?? 0
+        let requiredHeight = translated.map {
+            ceil($0.attributedStringValue.boundingRect(
+                with: NSSize(width: max(1, $0.frame.width), height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            ).height)
+        } ?? .greatestFiniteMagnitude
+        #expect(visibleHeight >= requiredHeight)
+    }
+
     @Test("Auto-follow positions the active subtitle near the top of the viewport")
     func floatingSubtitleFollowPosition() {
         let origin = SubtitleAutoFollow.scrollOrigin(

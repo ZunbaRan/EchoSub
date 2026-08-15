@@ -11,6 +11,7 @@ final class AppState {
     private(set) var currentVideoID: String?
     private(set) var playbackTime: Double = 0
     private(set) var lastErrorMessage: String?
+    private(set) var translationDiagnostics: [String: TranslationCueDiagnostic] = [:]
     private var translationJobs = TranslationJobRegistry()
     private var backgroundCardJobs: [String: UUID] = [:]
     private var backgroundCardErrors: [String: String] = [:]
@@ -117,6 +118,7 @@ final class AppState {
 
     func removeVideo(_ videoID: String) {
         translationJobs.cancel(videoID: videoID)
+        translationDiagnostics = translationDiagnostics.filter { !$0.key.hasPrefix("\(videoID)|") }
         glossJobs = glossJobs.filter { !$0.key.hasPrefix("\(videoID)|") }
         glossErrors = glossErrors.filter { !$0.key.hasPrefix("\(videoID)|") }
         detailJobs = detailJobs.filter { !$0.key.hasPrefix("\(videoID)|") }
@@ -192,6 +194,11 @@ final class AppState {
         startTranslation(videoID: currentVideoID, scope: .segment(id), clearUserOverrides: true)
     }
 
+    func translationDiagnostic(for segmentID: String, videoID: String? = nil) -> TranslationCueDiagnostic? {
+        guard let videoID = videoID ?? currentVideoID else { return nil }
+        return translationDiagnostics[translationDiagnosticKey(videoID: videoID, segmentID: segmentID)]
+    }
+
     func regenerateBackgroundCard(preservingUserTerms: Bool = false) {
         guard let videoID = currentVideoID else { return }
         let previous = currentBackgroundCard
@@ -250,10 +257,24 @@ final class AppState {
         guard !work.isEmpty else { return }
         guard plan.readiness != .notConfigured else {
             lastErrorMessage = TranslationError.notConfigured.localizedDescription
+            updateTranslationDiagnostics(
+                for: work,
+                videoID: video.id,
+                phase: .failed,
+                attempt: 0,
+                message: TranslationError.notConfigured.localizedDescription
+            )
             NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
             return
         }
         if plan.readiness == .waitingForBackgroundCard {
+            updateTranslationDiagnostics(
+                for: work,
+                videoID: video.id,
+                phase: .queued,
+                attempt: 0,
+                message: "正在等待视频全文概括完成，完成后会开始翻译。"
+            )
             requestBackgroundCard(videoID: video.id, force: false) { [weak self] _ in
                 self?.startTranslation(videoID: video.id, scope: scope, clearExisting: clearExisting, clearUserOverrides: clearUserOverrides, backgroundAttempted: true)
             }
@@ -269,6 +290,13 @@ final class AppState {
         }
         translationJobs.start(videoID: video.id, jobID: jobID)
         lastErrorMessage = nil
+        updateTranslationDiagnostics(
+            for: work,
+            videoID: video.id,
+            phase: .queued,
+            attempt: 0,
+            message: "已加入翻译队列。"
+        )
         diagnostics.record("translation.job.started", fields: [
             "job_id": jobID.uuidString,
             "video_id": video.id,
@@ -299,6 +327,7 @@ final class AppState {
         detailErrors.removeAll()
         detailCompletions.removeAll()
         translationJobs.cancelAll()
+        translationDiagnostics.removeAll()
         for index in library.videos.indices { library.videos[index].status = .idle }
         persist()
         NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
@@ -316,6 +345,7 @@ final class AppState {
         detailJobs.removeAll()
         detailErrors.removeAll()
         translationJobs.cancelAll()
+        translationDiagnostics.removeAll()
         currentVideoID = nil
         playbackTime = 0
         persist()
@@ -428,6 +458,14 @@ final class AppState {
         let backgroundCard = library.backgroundCards[video.id]
         let requestID = UUID()
         let startedAt = Date()
+        updateTranslationDiagnostics(
+            for: batch,
+            videoID: video.id,
+            phase: attempt == 0 ? .requesting : .retrying,
+            attempt: attempt + 1,
+            message: attempt == 0 ? "翻译请求已发送。" : "正在进行第 \(attempt + 1) 次尝试。",
+            requestID: requestID.uuidString
+        )
         diagnostics.record("translation.request.started", fields: [
             "job_id": jobID.uuidString,
             "request_id": requestID.uuidString,
@@ -470,6 +508,14 @@ final class AppState {
                     ])
                     let failedAttempt = attempt + 1
                     if let delay = TranslationRetryPolicy.delay(afterFailedAttempt: failedAttempt, error: error) {
+                        self.updateTranslationDiagnostics(
+                            for: batch,
+                            videoID: video.id,
+                            phase: .retrying,
+                            attempt: failedAttempt,
+                            message: "请求失败：\(error.localizedDescription)；将在 \(String(format: "%.1f", delay)) 秒后重试。",
+                            requestID: requestID.uuidString
+                        )
                         self.diagnostics.record("translation.request.retry_scheduled", fields: [
                             "job_id": jobID.uuidString,
                             "request_id": requestID.uuidString,
@@ -483,6 +529,14 @@ final class AppState {
                             self.translateBatch(batch, tail: tail, attempt: attempt + 1, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs)
                         }
                     } else {
+                        self.updateTranslationDiagnostics(
+                            for: batch,
+                            videoID: video.id,
+                            phase: .failed,
+                            attempt: failedAttempt,
+                            message: "连续 \(failedAttempt) 次失败：\(error.localizedDescription)",
+                            requestID: requestID.uuidString
+                        )
                         if self.currentVideoID == video.id { self.lastErrorMessage = error.localizedDescription }
                         self.diagnostics.record("translation.batch.skipped_after_retries", fields: [
                             "job_id": jobID.uuidString,
@@ -504,6 +558,16 @@ final class AppState {
                         "translated_count": String(translations.count),
                     ])
                     guard var document = self.library.transcripts[video.id] else { return }
+                    let returnedIDs = Set(translations.keys)
+                    let translatedSegments = batch.filter { returnedIDs.contains($0.id) }
+                    self.updateTranslationDiagnostics(
+                        for: translatedSegments,
+                        videoID: video.id,
+                        phase: .succeeded,
+                        attempt: attempt + 1,
+                        message: "模型已返回并保存此句译文，耗时 \(elapsedMS) ms。若界面仍未显示，请打开完整日志并反馈字幕 ID。",
+                        requestID: requestID.uuidString
+                    )
                     for index in document.segments.indices {
                         if let translated = translations[document.segments[index].id] {
                             document.segments[index].translation = translated
@@ -524,6 +588,14 @@ final class AppState {
                     }
                     if !unresolved.isEmpty,
                        let delay = TranslationRetryPolicy.delay(afterFailedAttempt: attempt + 1, error: TranslationError.malformedResponse) {
+                        self.updateTranslationDiagnostics(
+                            for: unresolved,
+                            videoID: video.id,
+                            phase: .retrying,
+                            attempt: attempt + 1,
+                            message: "请求成功，但模型没有返回此字幕 ID；将在 \(String(format: "%.1f", delay)) 秒后重试。",
+                            requestID: requestID.uuidString
+                        )
                         self.diagnostics.record("translation.partial_response.retry_scheduled", fields: [
                             "job_id": jobID.uuidString,
                             "video_id": video.id,
@@ -537,6 +609,16 @@ final class AppState {
                             self.translateBatch(unresolved, tail: tail, attempt: attempt + 1, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs)
                         }
                     } else {
+                        if !unresolved.isEmpty {
+                            self.updateTranslationDiagnostics(
+                                for: unresolved,
+                                videoID: video.id,
+                                phase: .failed,
+                                attempt: attempt + 1,
+                                message: "模型连续返回了不完整结果，没有包含此字幕 ID。",
+                                requestID: requestID.uuidString
+                            )
+                        }
                         self.translateQueue(tail, video: video, configuration: configuration, jobID: jobID, failedIDs: failedIDs.union(unresolved.map(\.id)))
                     }
                 }
@@ -551,6 +633,34 @@ final class AppState {
         }
         NotificationCenter.default.post(name: .echoLibraryChanged, object: nil)
         NotificationCenter.default.post(name: .echoTranscriptChanged, object: nil)
+    }
+
+    private func translationDiagnosticKey(videoID: String, segmentID: String) -> String {
+        "\(videoID)|\(segmentID)"
+    }
+
+    private func updateTranslationDiagnostics(
+        for segments: [SubtitleSegment],
+        videoID: String,
+        phase: TranslationCueDiagnosticPhase,
+        attempt: Int,
+        message: String,
+        requestID: String? = nil
+    ) {
+        let now = Date()
+        for segment in segments {
+            let key = translationDiagnosticKey(videoID: videoID, segmentID: segment.id)
+            translationDiagnostics[key] = TranslationCueDiagnostic(
+                videoID: videoID,
+                segmentID: segment.id,
+                phase: phase,
+                attempt: attempt,
+                maximumAttempts: TranslationRetryPolicy.maximumAttempts,
+                message: message,
+                requestID: requestID,
+                updatedAt: now
+            )
+        }
     }
 
     private func requestBackgroundCard(

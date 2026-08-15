@@ -104,6 +104,9 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         let retryLine = NSMenuItem(title: "补翻 / 重试此句", action: #selector(retryClickedSubtitle), keyEquivalent: "")
         retryLine.target = self
         contextMenu.addItem(retryLine)
+        let diagnosticLine = NSMenuItem(title: "查看此句翻译状态…", action: #selector(showClickedSubtitleDiagnostic), keyEquivalent: "")
+        diagnosticLine.target = self
+        contextMenu.addItem(diagnosticLine)
         table.menu = contextMenu
         let scroll = TransparentSubtitleScrollView()
         scroll.documentView = table
@@ -152,7 +155,12 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         observers.append(center.addObserver(forName: .echoVocabularyChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshVocabularyRows() })
     }
 
-    private func reload() { currentRow = -1; table.reloadData(); updateCurrentRow() }
+    private func reload() {
+        currentRow = -1
+        table.reloadData()
+        invalidateAllRowHeights()
+        updateCurrentRow()
+    }
 
     private func updateCurrentRow(forceScroll: Bool = false) {
         guard let segments = state.currentTranscript?.segments else { return }
@@ -166,6 +174,7 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         var rows = IndexSet()
         if old >= 0 { rows.insert(old) }
         if row >= 0 { rows.insert(row) }
+        table.noteHeightOfRows(withIndexesChanged: rows)
         table.reloadData(forRowIndexes: rows, columnIndexes: IndexSet(integer: 0))
         if autoFollow, row >= 0 { scrollCurrentRowNearTop(row) }
     }
@@ -221,18 +230,28 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         guard let segment = state.currentTranscript?.segments[safeOverlay: row] else { return 58 }
         let mode = SubtitleDisplayMode(rawValue: modeControl.selectedSegment) ?? .bilingual
+        let columnWidth = tableColumnWidth(in: tableView)
         return FloatingSubtitleLayout.rowHeight(
             for: segment,
             mode: mode,
-            availableWidth: table.bounds.width - 28,
+            availableWidth: columnWidth - 24,
             fontSize: CGFloat(settings.overlayFontSize),
             glossState: state.glossState(for: segment.id)
         )
     }
 
+    private func tableColumnWidth(in tableView: NSTableView) -> CGFloat {
+        tableView.tableColumns.first?.width ?? tableView.bounds.width
+    }
+
+    private func invalidateAllRowHeights() {
+        guard table.numberOfRows > 0 else { return }
+        table.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<table.numberOfRows))
+    }
+
     private func refreshRowHeights() {
         guard table.numberOfRows > 0 else { table.reloadData(); return }
-        table.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<table.numberOfRows))
+        invalidateAllRowHeights()
         table.reloadData()
     }
 
@@ -393,12 +412,31 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         state.translateSegment(id: segment.id)
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        guard menu === table.menu, let item = menu.items.first else { return }
+    @objc private func showClickedSubtitleDiagnostic() {
         let row = table.clickedRow
-        item.isEnabled = row >= 0
-        if row >= 0, let segment = state.currentTranscript?.segments[safeOverlay: row] {
-            item.title = segment.hasEffectiveTranslation ? "重新翻译此句" : "补翻此句"
+        guard row >= 0,
+              let videoID = state.currentVideoID,
+              let segment = state.currentTranscript?.segments[safeOverlay: row] else { return }
+        TranslationDiagnosticPresenter.present(segment: segment, videoID: videoID, state: state, parentWindow: window)
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === table.menu else { return }
+        let row = table.clickedRow
+        let segment = state.currentTranscript?.segments[safeOverlay: row]
+        for item in menu.items {
+            if item.action == #selector(retryClickedSubtitle) {
+                item.isEnabled = segment != nil
+                item.title = segment.map { $0.hasEffectiveTranslation ? "重新翻译此句" : "补翻此句" } ?? "补翻 / 重试此句"
+            } else if item.action == #selector(showClickedSubtitleDiagnostic) {
+                item.isEnabled = segment != nil
+                if let segment, let videoID = state.currentVideoID,
+                   let diagnostic = state.translationDiagnostic(for: segment.id, videoID: videoID) {
+                    item.title = diagnostic.menuTitle
+                } else {
+                    item.title = "查看此句翻译状态…"
+                }
+            }
         }
     }
 

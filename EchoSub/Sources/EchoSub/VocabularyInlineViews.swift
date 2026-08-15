@@ -73,16 +73,7 @@ final class GlossInlineView: NSView {
     }
 
     func height(for width: CGFloat) -> CGFloat {
-        let entryHeight: CGFloat
-        if entries.isEmpty {
-            entryHeight = 0
-        } else {
-            let attributed = makeAttributedString()
-            entryHeight = ceil(attributed.boundingRect(
-                with: NSSize(width: max(40, width), height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading]
-            ).height) + 2
-        }
+        let entryHeight = Self.measuredHeight(entries: entries, fontSize: fontSize, width: width)
         switch state {
         case .idle:
             return entryHeight
@@ -102,18 +93,13 @@ final class GlossInlineView: NSView {
         super.draw(dirtyRect)
         if !entries.isEmpty {
             layoutManager.ensureLayout(for: textContainer)
-            layoutManager.drawBackground(forGlyphRange: NSRange(location: 0, length: layoutManager.numberOfGlyphs), at: .zero)
-            layoutManager.drawGlyphs(forGlyphRange: NSRange(location: 0, length: layoutManager.numberOfGlyphs), at: .zero)
             if let hoveredIndex, entryLayouts.indices.contains(hoveredIndex) {
                 let closeRect = entryLayouts[hoveredIndex].closeRect
                 NSColor(calibratedWhite: 1, alpha: 0.06).setFill()
                 NSBezierPath(roundedRect: closeRect.insetBy(dx: 1, dy: 1), xRadius: 3, yRadius: 3).fill()
-                let close = NSAttributedString(string: "×", attributes: [
-                    .font: NSFont.systemFont(ofSize: max(10.5, fontSize), weight: .medium),
-                    .foregroundColor: NSColor.systemRed.withAlphaComponent(0.82),
-                ])
-                close.draw(in: closeRect)
             }
+            layoutManager.drawBackground(forGlyphRange: NSRange(location: 0, length: layoutManager.numberOfGlyphs), at: .zero)
+            layoutManager.drawGlyphs(forGlyphRange: NSRange(location: 0, length: layoutManager.numberOfGlyphs), at: .zero)
         }
         switch state {
         case .loading:
@@ -239,7 +225,19 @@ final class GlossInlineView: NSView {
         }
     }
 
+    static func measuredHeight(entries: [GlossEntry], fontSize: CGFloat, width: CGFloat) -> CGFloat {
+        guard !entries.isEmpty else { return 0 }
+        return ceil(makeAttributedString(entries: entries, fontSize: fontSize).boundingRect(
+            with: NSSize(width: max(40, width), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).height) + 2
+    }
+
     private func makeAttributedString() -> NSAttributedString {
+        Self.makeAttributedString(entries: entries, fontSize: fontSize)
+    }
+
+    private static func makeAttributedString(entries: [GlossEntry], fontSize: CGFloat) -> NSAttributedString {
         let output = NSMutableAttributedString()
         for (index, entry) in entries.enumerated() {
             let surface = NSAttributedString(string: "✨ \(entry.surface)", attributes: [

@@ -379,6 +379,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         let retryLine = NSMenuItem(title: "补翻 / 重试此句", action: #selector(retryClickedSubtitle), keyEquivalent: "")
         retryLine.target = self
         contextMenu.addItem(retryLine)
+        let diagnosticLine = NSMenuItem(title: "查看此句翻译状态…", action: #selector(showClickedSubtitleDiagnostic), keyEquivalent: "")
+        diagnosticLine.target = self
+        contextMenu.addItem(diagnosticLine)
         let editLine = NSMenuItem(title: "编辑译文", action: #selector(editClickedSubtitle), keyEquivalent: "")
         editLine.target = self
         contextMenu.addItem(editLine)
@@ -523,6 +526,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
 
     private func refreshTranscript() {
         subtitleTable.reloadData()
+        invalidateSubtitleRowHeights()
         guard let video = state.currentVideo else { subtitleFooter.stringValue = ""; return }
         if state.isCurrentBackgroundCardGenerating {
             subtitleFooter.stringValue = "正在理解完整视频内容…"
@@ -606,6 +610,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         var indexes = IndexSet()
         if previous >= 0 { indexes.insert(previous) }
         if row >= 0 { indexes.insert(row) }
+        subtitleTable.noteHeightOfRows(withIndexesChanged: indexes)
         subtitleTable.reloadData(forRowIndexes: indexes, columnIndexes: IndexSet(integer: 0))
         if autoFollow, row >= 0 { subtitleTable.scrollRowToVisible(row) }
     }
@@ -1288,6 +1293,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         let fetch = NSMenuItem(title: "重新获取原字幕", action: #selector(retryTranscript), keyEquivalent: "")
         fetch.target = self
         menu.addItem(fetch)
+        let log = NSMenuItem(title: "打开翻译诊断日志", action: #selector(openTranslationDiagnosticLog), keyEquivalent: "")
+        log.target = self
+        menu.addItem(log)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY - 2), in: sender)
     }
     @objc private func fillMissingTranslations() { state.translateMissing() }
@@ -1295,6 +1303,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         let row = subtitleTable.clickedRow
         guard row >= 0, let segment = state.currentTranscript?.segments[safe: row] else { return }
         state.translateSegment(id: segment.id)
+    }
+    @objc private func showClickedSubtitleDiagnostic() {
+        let row = subtitleTable.clickedRow
+        guard row >= 0,
+              let videoID = state.currentVideoID,
+              let segment = state.currentTranscript?.segments[safe: row] else { return }
+        TranslationDiagnosticPresenter.present(segment: segment, videoID: videoID, state: state, parentWindow: window)
+    }
+    @objc private func openTranslationDiagnosticLog() {
+        DiagnosticLogger.shared.record("diagnostics.opened_by_user", fields: ["source": "translation_menu"])
+        NSWorkspace.shared.open(DiagnosticLogger.shared.fileURL)
     }
     @objc private func confirmRetranslateAll() {
         guard let window else { return }
@@ -1330,22 +1349,32 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             menu.addItem(delete)
             return
         }
-        if menu === subtitleTable.menu, let item = menu.items.first {
+        if menu === subtitleTable.menu {
             let row = subtitleTable.clickedRow
-            item.isEnabled = row >= 0
-            if row >= 0, let segment = state.currentTranscript?.segments[safe: row] {
-                item.title = segment.hasEffectiveTranslation ? "重新翻译此句" : "补翻此句"
-            } else {
-                item.title = "补翻 / 重试此句"
-            }
-            if menu.items.count > 1 {
-                menu.items[1].isEnabled = row >= 0
-            }
-            if menu.items.count > 2 {
-                menu.items[2].isEnabled = row >= 0
-                    && selectionContext?.videoID == state.currentVideoID
-                    && selectionContext?.segmentID == state.currentTranscript?.segments[safe: row]?.id
-                    && selectionContext?.surface.isEmpty == false
+            let segment = state.currentTranscript?.segments[safe: row]
+            for item in menu.items {
+                switch item.action {
+                case #selector(retryClickedSubtitle):
+                    item.isEnabled = segment != nil
+                    item.title = segment.map { $0.hasEffectiveTranslation ? "重新翻译此句" : "补翻此句" } ?? "补翻 / 重试此句"
+                case #selector(showClickedSubtitleDiagnostic):
+                    item.isEnabled = segment != nil
+                    if let segment, let videoID = state.currentVideoID,
+                       let diagnostic = state.translationDiagnostic(for: segment.id, videoID: videoID) {
+                        item.title = diagnostic.menuTitle
+                    } else {
+                        item.title = "查看此句翻译状态…"
+                    }
+                case #selector(editClickedSubtitle):
+                    item.isEnabled = segment != nil
+                case #selector(lookupSelectedWordFromMenu):
+                    item.isEnabled = segment != nil
+                        && selectionContext?.videoID == state.currentVideoID
+                        && selectionContext?.segmentID == segment?.id
+                        && selectionContext?.surface.isEmpty == false
+                default:
+                    break
+                }
             }
         }
     }
