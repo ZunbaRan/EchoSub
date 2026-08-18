@@ -12,7 +12,7 @@ EchoSub 是一个原生 macOS YouTube 双语字幕学习工具，界面基于项
 - 原文、中文、双语三种显示方式。
 - 点击字幕跳转，播放时自动跟随。
 - 独立悬浮字幕窗和支持鼠标穿透的桌面歌词。
-- API Key 仅保存到 macOS Keychain。
+- 翻译 API Key 与 Supadata API Key 按产品设计以明文保存在本地应用数据目录，不上传云端。
 
 ## 字幕来源
 
@@ -25,6 +25,16 @@ swift build
 swift test
 swift run EchoSub
 ```
+
+## 本地数据
+
+播放列表、字幕与翻译结果保存在：
+
+```text
+~/Library/Application Support/EchoSub/library.json
+```
+
+翻译 API Key 与 Supadata API Key 保存在同目录的 `credentials.json`。该文件为本地明文配置，已被 Git 忽略，请勿提交或分享。
 
 当前开发环境只需要 macOS Command Line Tools。安装完整 Xcode 后也可以直接打开 `Package.swift`。
 
