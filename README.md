@@ -32,3 +32,10 @@ swift test
 ## 原型
 
 直接在浏览器中打开 `youtube-player/index.html`，即可查看无需构建工具的离线原型。
+
+## 产品与设计文档
+
+- `docs/youtube-bilingual-player-product-brief.zh-CN.md`：产品与 UI 设计说明
+- `docs/EchoSub-v0.1.2-UI-implementation-handoff.zh-CN.md`：实际 UI 实现交接
+- `docs/EchoSub-vocab-lookup-feature.zh-CN.md`：选词讲解与译文编辑功能说明
+- `docs/youtube-subtitle-translation-github-research.md`：字幕翻译开源方案研究

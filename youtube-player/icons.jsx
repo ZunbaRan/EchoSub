@@ -57,6 +57,16 @@
   const IconKey = (p) => (<I {...p}><circle cx="6.5" cy="10" r="3" /><path d="M9.5 10H17M14.5 10v2.5M17 10v2" /></I>);
   const IconDisplay = (p) => (<I {...p}><rect x="3" y="4" width="14" height="9.5" rx="1.8" /><path d="M8 16.5h4M10 13.5v3" /></I>);
   const IconClock = (p) => (<I {...p}><circle cx="10" cy="10" r="6.6" /><path d="M10 6.4V10l2.6 1.8" /></I>);
+  const IconRepeat = (p) => (<I {...p}><path d="M13.5 3.5 17 7l-3.5 3.5" /><path d="M17 7H6a3 3 0 0 0-3 3v1" /><path d="M6.5 16.5 3 13l3.5-3.5" /><path d="M3 13h11a3 3 0 0 0 3-3V9" /></I>);
+  const IconRepeat1 = (p) => (<I {...p}><path d="M13.5 3.5 17 7l-3.5 3.5" /><path d="M17 7H6a3 3 0 0 0-3 3v1" /><path d="M6.5 16.5 3 13l3.5-3.5" /><path d="M3 13h11a3 3 0 0 0 3-3V9" /><text x="10" y="12.4" textAnchor="middle" fontSize="6.5" fill="currentColor" stroke="none" fontWeight="700">1</text></I>);
+  const IconExpand = (p) => (<I {...p}><path d="M11.5 4H16v4.5M16 4l-5.5 5.5M8.5 16H4v-4.5M4 16l5.5-5.5" /></I>);
+  const IconSparkle = (p) => (<I {...p}><path d="M10 3.5 11.6 8 16 9.6 11.6 11.2 10 15.7 8.4 11.2 4 9.6 8.4 8 10 3.5Z" /><path d="M15.5 13.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8.8-2Z" strokeWidth="1.2" /></I>);
+  const IconFolder = (p) => (<I {...p}><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h3L9 6.5h6.5A1.5 1.5 0 0 1 17 8v6.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 14.5v-8Z" /></I>);
+  const IconTerminal = (p) => (<I {...p}><rect x="3" y="4" width="14" height="12" rx="2" /><path d="M6.5 8.5 9 11l-2.5 2.5M10.5 13.5H14" /></I>);
+  const IconOpacity = (p) => (<I {...p}><circle cx="10" cy="10" r="6.6" /><path d="M10 3.4a6.6 6.6 0 0 1 0 13.2V3.4Z" fill="currentColor" stroke="none" /></I>);
+  const IconEyeOff = (p) => (<I {...p}><path d="M4 4l12 12" /><path d="M7.5 5.8A8.9 8.9 0 0 1 10 5c4.5 0 7.5 5 7.5 5a13.6 13.6 0 0 1-2.3 2.9M12.5 14.2c-.8.5-1.6.8-2.5.8-4.5 0-7.5-5-7.5-5a13.4 13.4 0 0 1 2.6-3" /><path d="M8.3 8.4a2.2 2.2 0 0 0 3.1 3.1" /></I>);
+  const IconRestore = (p) => (<I {...p}><path d="M4 8.5A6 6 0 1 1 5.7 13" /><path d="M4 4v4.5h4.5" /></I>);
+  const IconDocText = (p) => (<I {...p}><path d="M6 3.5h5.5L15 7v9.5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 5 16.5v-11A1.5 1.5 0 0 1 6.5 3.5Z" /><path d="M11 3.5V7h4" /><path d="M7.5 10.5h5M7.5 13.5h5" strokeWidth="1.3" /></I>);
 
   Object.assign(window, {
     I,
@@ -65,6 +75,8 @@
     IconExternal, IconMore, IconCheck, IconRefresh, IconX, IconAlert,
     IconChevronD, IconTranslate, IconTextSize, IconFollow, IconLock, IconUnlock,
     IconCaptions, IconYoutube, IconClipboard, IconPaste, IconEye, IconTrash,
-    IconKey, IconDisplay, IconClock,
+    IconKey, IconDisplay, IconClock, IconRepeat, IconRepeat1, IconExpand,
+    IconSparkle, IconFolder, IconTerminal, IconOpacity, IconEyeOff,
+    IconRestore, IconDocText,
   });
 })();
