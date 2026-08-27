@@ -106,27 +106,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func toggleFloatingWindow() {
         if let controller = floatingWindowController, controller.window?.isVisible == true {
-            controller.window?.orderOut(nil)
+            controller.hideManagedOverlay()
         } else {
             let isNew = floatingWindowController == nil
             let controller = floatingWindowController ?? FloatingSubtitleWindowController()
             floatingWindowController = controller
             controller.showWindow(nil)
             if isNew { controller.window?.center() }
-            controller.window?.orderFrontRegardless()
+            controller.showManagedOverlay()
         }
     }
 
     private func toggleLyricsWindow() {
         if let controller = lyricsWindowController, controller.window?.isVisible == true {
-            controller.window?.orderOut(nil)
+            controller.hideManagedOverlay()
         } else {
             let isNew = lyricsWindowController == nil
             let controller = lyricsWindowController ?? DesktopLyricsWindowController()
             lyricsWindowController = controller
             controller.showWindow(nil)
             if isNew { controller.window?.center() }
-            controller.window?.orderFrontRegardless()
+            controller.showManagedOverlay()
         }
     }
 

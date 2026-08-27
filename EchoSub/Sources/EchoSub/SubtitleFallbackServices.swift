@@ -136,8 +136,8 @@ final class YTDLPTranscriptProvider {
                     segments: segments,
                     provider: .ytDLP
                 ),
-                title: info.title ?? "YouTube 视频",
-                channel: info.uploader ?? info.channel ?? "YouTube",
+                title: info.title ?? VideoItem.placeholderTitle,
+                channel: info.uploader ?? info.channel ?? VideoItem.placeholderChannel,
                 duration: info.duration
             )))
         }.resume()
@@ -251,8 +251,8 @@ final class SupadataTranscriptProvider {
                         segments: segments,
                         provider: .supadata
                     ),
-                    title: "YouTube 视频",
-                    channel: "YouTube",
+                    title: VideoItem.placeholderTitle,
+                    channel: VideoItem.placeholderChannel,
                     duration: nil
                 )))
                 return

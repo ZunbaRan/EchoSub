@@ -47,6 +47,9 @@ enum TranscriptProvider: String, Codable {
 }
 
 struct VideoItem: Codable, Identifiable, Equatable {
+    static let placeholderTitle = "YouTube 视频"
+    static let placeholderChannel = "YouTube"
+
     let id: String
     var url: String
     var title: String
@@ -60,8 +63,8 @@ struct VideoItem: Codable, Identifiable, Equatable {
     init(id: String, url: String) {
         self.id = id
         self.url = url
-        self.title = "YouTube 视频"
-        self.channel = "YouTube"
+        self.title = Self.placeholderTitle
+        self.channel = Self.placeholderChannel
         self.thumbnailURL = "https://i.ytimg.com/vi/\(id)/hqdefault.jpg"
         self.duration = nil
         self.progress = 0

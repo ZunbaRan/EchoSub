@@ -23,6 +23,119 @@ struct TranscriptFetchResult {
     var title: String
     var channel: String
     var duration: Double?
+
+    var needsMetadataEnrichment: Bool {
+        YouTubePageMetadata.isPlaceholderTitle(title)
+    }
+
+    func applying(_ metadata: YouTubePageMetadata.Snapshot) -> TranscriptFetchResult {
+        var copy = self
+        if needsMetadataEnrichment, let title = metadata.title, !YouTubePageMetadata.isPlaceholderTitle(title) {
+            copy.title = title
+        }
+        if copy.channel.isEmpty || copy.channel == VideoItem.placeholderChannel,
+           let channel = metadata.channel?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !channel.isEmpty {
+            copy.channel = channel
+        }
+        if copy.duration == nil { copy.duration = metadata.duration }
+        return copy
+    }
+}
+
+enum YouTubePageMetadata {
+    struct Snapshot {
+        var title: String?
+        var channel: String?
+        var duration: Double?
+    }
+
+    static func isPlaceholderTitle(_ title: String) -> Bool {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || trimmed == VideoItem.placeholderTitle
+    }
+
+    static func oEmbedURL(for videoID: String) -> URL {
+        var components = URLComponents(string: "https://www.youtube.com/oembed")!
+        components.queryItems = [
+            URLQueryItem(name: "url", value: YouTubeURLParser.canonicalURL(for: videoID)),
+            URLQueryItem(name: "format", value: "json"),
+        ]
+        return components.url!
+    }
+
+    static func parseOEmbed(data: Data) -> Snapshot? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let title = (json["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let channel = (json["author_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let title, !isPlaceholderTitle(title) else { return nil }
+        return Snapshot(
+            title: title,
+            channel: channel?.isEmpty == false ? channel : nil,
+            duration: nil
+        )
+    }
+
+    static func parseWatchPage(_ html: String) -> Snapshot {
+        var snapshot = Snapshot()
+        if let title = firstMatch(#"<meta[^>]+(?:property|name)="(?:og:title|title)"[^>]+content="([^"]+)""#, in: html)
+            ?? firstMatch(#"<meta[^>]+content="([^"]+)"[^>]+(?:property|name)="(?:og:title|title)""#, in: html)
+            ?? firstMatch(#"<title>(.+?)</title>"#, in: html) {
+            snapshot.title = unescape(title)
+                .replacingOccurrences(of: " - YouTube", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let channel = firstMatch(#"<link itemprop="name" content="([^"]+)">"#, in: html)
+            ?? firstMatch(#""author":"([^"]+)""#, in: html) {
+            snapshot.channel = unescape(channel)
+        }
+        if let seconds = firstMatch(#""lengthSeconds":"(\d+)""#, in: html).flatMap(Double.init) {
+            snapshot.duration = seconds
+        }
+        return snapshot
+    }
+
+    static func fetch(videoID: String, session: URLSession, completion: @escaping (Snapshot) -> Void) {
+        var request = URLRequest(url: oEmbedURL(for: videoID))
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        session.dataTask(with: request) { data, _, _ in
+            if let data, let snapshot = parseOEmbed(data: data) {
+                completion(snapshot)
+                return
+            }
+            guard let watchURL = URL(string: YouTubeURLParser.canonicalURL(for: videoID)) else {
+                completion(Snapshot())
+                return
+            }
+            var pageRequest = URLRequest(url: watchURL)
+            pageRequest.setValue("https://www.youtube.com/", forHTTPHeaderField: "Referer")
+            session.dataTask(with: pageRequest) { data, _, _ in
+                guard let data, let html = String(data: data, encoding: .utf8) else {
+                    completion(Snapshot())
+                    return
+                }
+                completion(parseWatchPage(html))
+            }.resume()
+        }.resume()
+    }
+
+    private static func firstMatch(_ pattern: String, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              match.numberOfRanges > 1,
+              let range = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[range])
+    }
+
+    private static func unescape(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+    }
 }
 
 final class YouTubeTranscriptService {
@@ -43,19 +156,31 @@ final class YouTubeTranscriptService {
     func fetch(videoID: String, completion: @escaping (Result<TranscriptFetchResult, Error>) -> Void) {
         fetchDirect(videoID: videoID) { [weak self] result in
             switch result {
-            case .success:
-                completion(result)
+            case .success(let fetched):
+                guard let self else {
+                    completion(.success(fetched))
+                    return
+                }
+                self.complete(fetched, videoID: videoID, completion: completion)
             case .failure(let directError):
                 self?.ytDLPProvider.fetch(videoID: videoID) { ytDLPResult in
                     switch ytDLPResult {
-                    case .success:
-                        completion(ytDLPResult)
+                    case .success(let fetched):
+                        guard let self else {
+                            completion(.success(fetched))
+                            return
+                        }
+                        self.complete(fetched, videoID: videoID, completion: completion)
                     case .failure(let ytDLPError):
                         let key = AppSettings.shared.supadataAPIKey
                         self?.supadataProvider.fetch(videoID: videoID, apiKey: key) { supadataResult in
                             switch supadataResult {
-                            case .success:
-                                completion(supadataResult)
+                            case .success(let fetched):
+                                guard let self else {
+                                    completion(.success(fetched))
+                                    return
+                                }
+                                self.complete(fetched, videoID: videoID, completion: completion)
                             case .failure(let supadataError):
                                 completion(.failure(SubtitleFallbackError.allProvidersFailed([
                                     "YouTube：\(directError.localizedDescription)",
@@ -67,6 +192,20 @@ final class YouTubeTranscriptService {
                     }
                 }
             }
+        }
+    }
+
+    private func complete(
+        _ fetched: TranscriptFetchResult,
+        videoID: String,
+        completion: @escaping (Result<TranscriptFetchResult, Error>) -> Void
+    ) {
+        guard fetched.needsMetadataEnrichment else {
+            completion(.success(fetched))
+            return
+        }
+        YouTubePageMetadata.fetch(videoID: videoID, session: session) { snapshot in
+            completion(.success(fetched.applying(snapshot)))
         }
     }
 
@@ -150,8 +289,8 @@ final class YouTubeTranscriptService {
                         segments: segments,
                         provider: .youtube
                     ),
-                    title: details?.title ?? "YouTube 视频",
-                    channel: details?.author ?? "YouTube",
+                    title: details?.title ?? VideoItem.placeholderTitle,
+                    channel: details?.author ?? VideoItem.placeholderChannel,
                     duration: details?.lengthSeconds.flatMap(Double.init)
                 )))
             }

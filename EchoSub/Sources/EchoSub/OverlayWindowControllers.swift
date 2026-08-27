@@ -1,5 +1,23 @@
 import AppKit
 
+enum OverlayWindowPresentation {
+    static func shouldRaisePinnedWindow(isPinned: Bool, isVisible: Bool) -> Bool {
+        isPinned && isVisible
+    }
+}
+
+extension NSWindowController {
+    func hideManagedOverlay() {
+        (window as? NSPanel)?.isFloatingPanel = false
+        window?.orderOut(nil)
+    }
+
+    func showManagedOverlay() {
+        (window as? NSPanel)?.isFloatingPanel = true
+        window?.orderFrontRegardless()
+    }
+}
+
 final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelegate, NSMenuDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private let state = AppState.shared
     private let settings = AppSettings.shared
@@ -221,8 +239,14 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         var behavior: NSWindow.CollectionBehavior = [.fullScreenAuxiliary, .stationary]
         if settings.showsOnAllSpaces { behavior.insert(.canJoinAllSpaces) }
         window?.collectionBehavior = behavior
-        if pinned { window?.orderFrontRegardless() }
+        if OverlayWindowPresentation.shouldRaisePinnedWindow(isPinned: pinned, isVisible: window?.isVisible == true) {
+            window?.orderFrontRegardless()
+        }
         refreshControls()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        (window as? NSPanel)?.isFloatingPanel = false
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { state.currentTranscript?.segments.count ?? 0 }
@@ -782,7 +806,11 @@ final class DesktopLyricsWindowController: NSWindowController, NSWindowDelegate 
         settings.desktopLyricsBackgroundOpacity = sender.doubleValue
         updateBackgroundOpacity(sender.doubleValue)
     }
-    @objc private func closeLyrics() { window?.orderOut(nil) }
+    @objc private func closeLyrics() { hideManagedOverlay() }
+
+    func windowWillClose(_ notification: Notification) {
+        (window as? NSPanel)?.isFloatingPanel = false
+    }
 
     func windowDidResize(_ notification: Notification) {
         guard let width = window?.frame.width, abs(width - previousWidth) > 1 else { return }

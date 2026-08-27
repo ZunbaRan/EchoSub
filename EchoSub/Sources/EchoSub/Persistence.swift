@@ -132,12 +132,12 @@ final class AppSettings {
             guard defaults.object(forKey: "subtitleMode") != nil else { return .bilingual }
             return SubtitleDisplayMode(rawValue: defaults.integer(forKey: "subtitleMode")) ?? .bilingual
         }
-        set { defaults.set(newValue.rawValue, forKey: "subtitleMode"); changed() }
+        set { update(newValue.rawValue, key: "subtitleMode", current: subtitleMode.rawValue) }
     }
 
     var autoFollow: Bool {
         get { defaults.object(forKey: "autoFollow") == nil ? true : defaults.bool(forKey: "autoFollow") }
-        set { defaults.set(newValue, forKey: "autoFollow"); changed() }
+        set { update(newValue, key: "autoFollow", current: autoFollow) }
     }
 
     var playbackLoopMode: PlaybackLoopMode {
@@ -145,37 +145,37 @@ final class AppSettings {
             guard defaults.object(forKey: "playbackLoopMode") != nil else { return .none }
             return PlaybackLoopMode(rawValue: defaults.integer(forKey: "playbackLoopMode")) ?? .none
         }
-        set { defaults.set(newValue.rawValue, forKey: "playbackLoopMode"); changed() }
+        set { update(newValue.rawValue, key: "playbackLoopMode", current: playbackLoopMode.rawValue) }
     }
 
     var translationBaseURL: String {
         get { defaults.string(forKey: "translationBaseURL") ?? "https://dashscope.aliyuncs.com/compatible-mode/v1" }
-        set { defaults.set(newValue, forKey: "translationBaseURL"); changed() }
+        set { update(newValue, key: "translationBaseURL", current: translationBaseURL) }
     }
 
     var translationModel: String {
         get { defaults.string(forKey: "translationModel") ?? "qwen3.7-plus" }
-        set { defaults.set(newValue, forKey: "translationModel"); changed() }
+        set { update(newValue, key: "translationModel", current: translationModel) }
     }
 
     var overlayFontSize: Double {
         get { defaults.object(forKey: "overlayFontSize") == nil ? 20 : defaults.double(forKey: "overlayFontSize") }
-        set { defaults.set(newValue, forKey: "overlayFontSize"); changed() }
+        set { update(newValue, key: "overlayFontSize", current: overlayFontSize) }
     }
 
     var desktopEnglishFontSize: Double {
         get { defaults.object(forKey: "desktopEnglishFontSize") == nil ? 27 : defaults.double(forKey: "desktopEnglishFontSize") }
-        set { defaults.set(min(48, max(12, newValue)), forKey: "desktopEnglishFontSize"); changed() }
+        set { update(min(48, max(12, newValue)), key: "desktopEnglishFontSize", current: desktopEnglishFontSize) }
     }
 
     var desktopChineseFontSize: Double {
         get { defaults.object(forKey: "desktopChineseFontSize") == nil ? 18 : defaults.double(forKey: "desktopChineseFontSize") }
-        set { defaults.set(min(48, max(12, newValue)), forKey: "desktopChineseFontSize"); changed() }
+        set { update(min(48, max(12, newValue)), key: "desktopChineseFontSize", current: desktopChineseFontSize) }
     }
 
     var overlayPlateEnabled: Bool {
         get { defaults.object(forKey: "overlayPlateEnabled") == nil ? true : defaults.bool(forKey: "overlayPlateEnabled") }
-        set { defaults.set(newValue, forKey: "overlayPlateEnabled"); changed() }
+        set { update(newValue, key: "overlayPlateEnabled", current: overlayPlateEnabled) }
     }
 
     var desktopLyricsBackgroundOpacity: Double {
@@ -183,7 +183,7 @@ final class AppSettings {
             guard defaults.object(forKey: "desktopLyricsBackgroundOpacity") != nil else { return 0.72 }
             return min(1, max(0, defaults.double(forKey: "desktopLyricsBackgroundOpacity")))
         }
-        set { defaults.set(min(1, max(0, newValue)), forKey: "desktopLyricsBackgroundOpacity"); changed() }
+        set { update(min(1, max(0, newValue)), key: "desktopLyricsBackgroundOpacity", current: desktopLyricsBackgroundOpacity) }
     }
 
     var floatingBackgroundOpacity: Double {
@@ -191,25 +191,29 @@ final class AppSettings {
             guard defaults.object(forKey: "floatingBackgroundOpacity") != nil else { return 0.96 }
             return min(1, max(0, defaults.double(forKey: "floatingBackgroundOpacity")))
         }
-        set { defaults.set(min(1, max(0, newValue)), forKey: "floatingBackgroundOpacity"); changed() }
+        set { update(min(1, max(0, newValue)), key: "floatingBackgroundOpacity", current: floatingBackgroundOpacity) }
     }
 
     var subtitlePaletteID: String {
         get { defaults.string(forKey: "subtitlePaletteID") ?? SubtitlePalette.defaultPalette.id }
-        set { defaults.set(newValue, forKey: "subtitlePaletteID"); changed() }
+        set { update(newValue, key: "subtitlePaletteID", current: subtitlePaletteID) }
     }
 
     var englishColorHex: String {
         get { defaults.string(forKey: "englishColorHex") ?? defaults.string(forKey: "englishFillHex") ?? SubtitlePalette.defaultPalette.englishColor }
-        set { defaults.set(newValue, forKey: "englishColorHex"); changed() }
+        set { update(newValue, key: "englishColorHex", current: englishColorHex) }
     }
 
     var chineseColorHex: String {
         get { defaults.string(forKey: "chineseColorHex") ?? defaults.string(forKey: "chineseFillHex") ?? SubtitlePalette.defaultPalette.chineseColor }
-        set { defaults.set(newValue, forKey: "chineseColorHex"); changed() }
+        set { update(newValue, key: "chineseColorHex", current: chineseColorHex) }
     }
 
     func applySubtitlePalette(_ palette: SubtitlePalette) {
+        let unchanged = subtitlePaletteID == palette.id
+            && englishColorHex == palette.englishColor
+            && chineseColorHex == palette.chineseColor
+        guard !unchanged else { return }
         defaults.set(palette.id, forKey: "subtitlePaletteID")
         defaults.set(palette.englishColor, forKey: "englishColorHex")
         defaults.set(palette.chineseColor, forKey: "chineseColorHex")
@@ -218,12 +222,12 @@ final class AppSettings {
 
     var floatPinned: Bool {
         get { defaults.object(forKey: "floatPinned") == nil ? true : defaults.bool(forKey: "floatPinned") }
-        set { defaults.set(newValue, forKey: "floatPinned"); changed() }
+        set { update(newValue, key: "floatPinned", current: floatPinned) }
     }
 
     var showsOnAllSpaces: Bool {
         get { defaults.object(forKey: "showsOnAllSpaces") == nil ? true : defaults.bool(forKey: "showsOnAllSpaces") }
-        set { defaults.set(newValue, forKey: "showsOnAllSpaces"); changed() }
+        set { update(newValue, key: "showsOnAllSpaces", current: showsOnAllSpaces) }
     }
 
     var translationConfiguration: TranslationConfiguration {
@@ -238,6 +242,12 @@ final class AppSettings {
 
     func reset() {
         ["subtitleMode", "autoFollow", "playbackLoopMode", "translationBaseURL", "translationModel", "overlayFontSize", "desktopEnglishFontSize", "desktopChineseFontSize", "overlayPlateEnabled", "desktopLyricsBackgroundOpacity", "floatingBackgroundOpacity", "subtitlePaletteID", "englishColorHex", "chineseColorHex", "englishFillHex", "englishEdgeHex", "chineseFillHex", "chineseEdgeHex", "floatPinned", "showsOnAllSpaces", "mainPlaylistWidth", "mainSubtitleWidth"].forEach(defaults.removeObject(forKey:))
+        changed()
+    }
+
+    private func update<T: Equatable>(_ value: T, key: String, current: T) {
+        guard value != current else { return }
+        defaults.set(value, forKey: key)
         changed()
     }
 

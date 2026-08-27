@@ -39,11 +39,14 @@ enum TranslationRequestPurpose {
 enum TranslationRequestPolicy {
     static let batchSize = 4
     static let translationTimeout: TimeInterval = 120
-    static let backgroundCardTimeout: TimeInterval = 180
+    static let backgroundCardTimeout: TimeInterval = 600
+    static let backgroundCardResourceTimeout: TimeInterval = 720
 
     static func thinkingMode(model: String, purpose: TranslationRequestPurpose) -> Bool? {
         let normalized = model.lowercased()
-        let supportsExplicitThinking = normalized.contains("qwen3") || normalized.contains("deepseek-v4")
+        let supportsExplicitThinking = normalized.contains("qwen3")
+            || normalized.contains("qwen-3")
+            || normalized.contains("deepseek-v4")
         guard supportsExplicitThinking else { return nil }
         switch purpose {
         case .translation: return false
@@ -68,7 +71,208 @@ enum TranslationRequestPolicy {
     }
 }
 
+enum BackgroundCardRequestPlanner {
+    /// DeepSeek v4 and Qwen 3.8 Flash both advertise a 1M-token context window.
+    static let modelContextTokens = 1_000_000
+    /// Cue JSON is mostly English/punctuation; 4 characters ≈ 1 token.
+    static let charactersPerToken = 4
+    static let reservedPromptTokens = 4_096
+    static let reservedOutputTokens = 8_192
+    static let reservedThinkingTokens = 200_000
+    static let safetyMarginTokens = 32_768
+
+    static var singlePassTokenBudget: Int {
+        modelContextTokens - reservedPromptTokens - reservedOutputTokens - reservedThinkingTokens - safetyMarginTokens
+    }
+
+    static var chunkTokenBudget: Int {
+        min(singlePassTokenBudget, 500_000)
+    }
+
+    static var thinkingInputLimitTokens: Int { singlePassTokenBudget }
+    static var singlePassCharacterBudget: Int { singlePassTokenBudget * charactersPerToken }
+    static var chunkCharacterBudget: Int { chunkTokenBudget * charactersPerToken }
+
+    struct Plan: Equatable {
+        var chunks: [[SubtitleSegment]]
+        var characterCount: Int
+
+        var usesSinglePass: Bool { chunks.count <= 1 }
+        var estimatedTokens: Int { BackgroundCardRequestPlanner.estimatedTokens(characterCount: characterCount) }
+        var disablesThinking: Bool {
+            usesSinglePass && shouldDisableThinking(characterCount: characterCount)
+        }
+    }
+
+    static func estimatedTokens(characterCount: Int) -> Int {
+        guard characterCount > 0 else { return 0 }
+        return (characterCount + charactersPerToken - 1) / charactersPerToken
+    }
+
+    static func shouldDisableThinking(characterCount: Int) -> Bool {
+        estimatedTokens(characterCount: characterCount) > thinkingInputLimitTokens
+    }
+
+    static func cuePayload(from segments: [SubtitleSegment]) -> [[String: Any]] {
+        segments.map {
+            [
+                "id": $0.id,
+                "start": Int($0.start.rounded()),
+                "text": $0.original,
+            ]
+        }
+    }
+
+    static func encodedCharacterCount(for segments: [SubtitleSegment]) -> Int {
+        guard let data = try? JSONSerialization.data(withJSONObject: cuePayload(from: segments)) else {
+            return segments.reduce(0) { $0 + $1.original.count + 48 }
+        }
+        return data.count
+    }
+
+    static func plan(segments: [SubtitleSegment], forceChunked: Bool = false) -> Plan {
+        let characterCount = encodedCharacterCount(for: segments)
+        guard !segments.isEmpty else {
+            return Plan(chunks: [], characterCount: 0)
+        }
+        let tokens = estimatedTokens(characterCount: characterCount)
+        if !forceChunked, tokens <= singlePassTokenBudget {
+            return Plan(chunks: [segments], characterCount: characterCount)
+        }
+        var chunks = split(segments)
+        if forceChunked, chunks.count == 1, segments.count > 1 {
+            let mid = max(1, segments.count / 2)
+            chunks = [Array(segments[..<mid]), Array(segments[mid...])]
+        }
+        return Plan(chunks: chunks, characterCount: characterCount)
+    }
+
+    static func split(_ segments: [SubtitleSegment]) -> [[SubtitleSegment]] {
+        var chunks: [[SubtitleSegment]] = []
+        var current: [SubtitleSegment] = []
+        var currentCount = 2
+
+        func flush() {
+            guard !current.isEmpty else { return }
+            chunks.append(current)
+            current.removeAll(keepingCapacity: true)
+            currentCount = 2
+        }
+
+        for segment in segments {
+            let piece = encodedCharacterCount(for: [segment])
+            if !current.isEmpty, currentCount + piece + 1 > chunkCharacterBudget {
+                flush()
+            }
+            current.append(segment)
+            currentCount += piece + 1
+        }
+        flush()
+        return chunks
+    }
+
+    static func isContextOverflow(_ error: Error) -> Bool {
+        let text = error.localizedDescription.lowercased()
+        let markers = [
+            "context length",
+            "context_length",
+            "maximum context",
+            "max context",
+            "too many tokens",
+            "token limit",
+            "prompt is too long",
+            "input length",
+            "range of input length",
+            "exceeds the model's",
+            "exceed context",
+            "context window",
+        ]
+        if markers.contains(where: { text.contains($0) }) { return true }
+        if case TranslationError.requestFailed(let statusCode, _, _) = error {
+            return statusCode == 413
+        }
+        return false
+    }
+
+    static func isTimeout(_ error: Error) -> Bool {
+        if (error as? URLError)?.code == .timedOut { return true }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorTimedOut
+    }
+
+    static func isRecoverableByChunking(_ error: Error) -> Bool {
+        isContextOverflow(error) || isTimeout(error)
+    }
+}
+
+enum BackgroundCardMerger {
+    static func merge(_ cards: [VideoBackgroundCard], videoID: String, segmentCount: Int) -> VideoBackgroundCard {
+        let usable = cards.filter { !$0.overview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let source = usable.isEmpty ? cards : usable
+        return VideoBackgroundCard(
+            videoID: videoID,
+            overview: source.map(\.overview).filter { !$0.isEmpty }.joined(separator: "\n"),
+            chapters: source.flatMap(\.chapters).sorted { $0.start < $1.start },
+            domain: source.map(\.domain).first(where: { !$0.isEmpty }) ?? "",
+            tone: source.map(\.tone).first(where: { !$0.isEmpty }) ?? "",
+            entities: mergeNamed(source.flatMap(\.entities)),
+            terminology: mergeTerms(source.flatMap(\.terminology)),
+            uncertainties: Array(source.flatMap(\.uncertainties).prefix(16)),
+            generatedAt: Date(),
+            editedAt: nil,
+            sourceSegmentCount: segmentCount
+        )
+    }
+
+    private static func mergeNamed(_ items: [BackgroundEntity]) -> [BackgroundEntity] {
+        var result: [BackgroundEntity] = []
+        var indexBySource: [String: Int] = [:]
+        for item in items {
+            let key = item.source.lowercased()
+            if let index = indexBySource[key] {
+                var existing = result[index]
+                existing.evidenceCueIDs = Array(Set(existing.evidenceCueIDs + item.evidenceCueIDs))
+                if existing.preferredTranslation.isEmpty {
+                    existing.preferredTranslation = item.preferredTranslation
+                }
+                result[index] = existing
+            } else {
+                indexBySource[key] = result.count
+                result.append(item)
+            }
+        }
+        return result
+    }
+
+    private static func mergeTerms(_ items: [BackgroundTerm]) -> [BackgroundTerm] {
+        var result: [BackgroundTerm] = []
+        var indexBySource: [String: Int] = [:]
+        for item in items {
+            let key = item.source.lowercased()
+            if let index = indexBySource[key] {
+                var existing = result[index]
+                existing.evidenceCueIDs = Array(Set(existing.evidenceCueIDs + item.evidenceCueIDs))
+                if existing.preferredTranslation.isEmpty {
+                    existing.preferredTranslation = item.preferredTranslation
+                }
+                result[index] = existing
+            } else {
+                indexBySource[key] = result.count
+                result.append(item)
+            }
+        }
+        return result
+    }
+}
+
 final class TranslationService {
+    private static let backgroundCardSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = TranslationRequestPolicy.backgroundCardTimeout
+        configuration.timeoutIntervalForResource = TranslationRequestPolicy.backgroundCardResourceTimeout
+        return URLSession(configuration: configuration)
+    }()
+
     func translate(
         segments: [SubtitleSegment],
         context: [SubtitleSegment],
@@ -204,42 +408,196 @@ final class TranslationService {
         configuration: TranslationConfiguration,
         completion: @escaping (Result<VideoBackgroundCard, Error>) -> Void
     ) {
+        generateBackgroundCard(
+            document: document,
+            video: video,
+            configuration: configuration,
+            forceChunked: false,
+            completion: completion
+        )
+    }
+
+    private func generateBackgroundCard(
+        document: TranscriptDocument,
+        video: VideoItem,
+        configuration: TranslationConfiguration,
+        forceChunked: Bool,
+        completion: @escaping (Result<VideoBackgroundCard, Error>) -> Void
+    ) {
         guard !configuration.apiKey.isEmpty else {
             completion(.failure(TranslationError.notConfigured))
             return
         }
+        let plan = BackgroundCardRequestPlanner.plan(segments: document.segments, forceChunked: forceChunked)
+        DiagnosticLogger.shared.record("background_card.plan", fields: [
+            "video_id": video.id,
+            "segments": String(document.segments.count),
+            "character_count": String(plan.characterCount),
+            "estimated_tokens": String(plan.estimatedTokens),
+            "context_window_tokens": String(BackgroundCardRequestPlanner.modelContextTokens),
+            "single_pass_token_budget": String(BackgroundCardRequestPlanner.singlePassTokenBudget),
+            "chunks": String(plan.chunks.count),
+            "force_chunked": String(forceChunked),
+            "disable_thinking": String(plan.disablesThinking),
+            "timeout_seconds": String(Int(TranslationRequestPolicy.backgroundCardTimeout)),
+        ])
+        guard !plan.chunks.isEmpty else {
+            completion(.failure(TranslationError.malformedResponse))
+            return
+        }
+        if plan.chunks.count == 1 {
+            requestBackgroundCard(
+                segments: plan.chunks[0],
+                document: document,
+                video: video,
+                configuration: configuration,
+                part: nil,
+                of: 1
+            ) { [weak self] result in
+                switch result {
+                case .success:
+                    completion(result)
+                case .failure(let error)
+                    where !forceChunked
+                    && document.segments.count > 12
+                    && BackgroundCardRequestPlanner.isRecoverableByChunking(error):
+                    let chunked = BackgroundCardRequestPlanner.plan(segments: document.segments, forceChunked: true)
+                    guard chunked.chunks.count > 1 else {
+                        completion(.failure(error))
+                        return
+                    }
+                    DiagnosticLogger.shared.record("background_card.retry_chunked", fields: [
+                        "video_id": video.id,
+                        "error": error.localizedDescription,
+                        "chunks": String(chunked.chunks.count),
+                    ])
+                    self?.generateBackgroundCard(
+                        document: document,
+                        video: video,
+                        configuration: configuration,
+                        forceChunked: true,
+                        completion: completion
+                    )
+                case .failure:
+                    completion(result)
+                }
+            }
+            return
+        }
+        generateChunkedBackgroundCard(
+            chunks: plan.chunks,
+            document: document,
+            video: video,
+            configuration: configuration,
+            completion: completion
+        )
+    }
+
+    private func generateChunkedBackgroundCard(
+        chunks: [[SubtitleSegment]],
+        document: TranscriptDocument,
+        video: VideoItem,
+        configuration: TranslationConfiguration,
+        completion: @escaping (Result<VideoBackgroundCard, Error>) -> Void
+    ) {
+        var remaining = chunks
+        var collected: [VideoBackgroundCard] = []
+        var lastError: Error = TranslationError.malformedResponse
+        let total = chunks.count
+
+        func workNext() {
+            guard !remaining.isEmpty else {
+                guard !collected.isEmpty else {
+                    completion(.failure(lastError))
+                    return
+                }
+                completion(.success(BackgroundCardMerger.merge(
+                    collected,
+                    videoID: video.id,
+                    segmentCount: document.segments.count
+                )))
+                return
+            }
+            let chunk = remaining.removeFirst()
+            let part = collected.count + 1
+            requestBackgroundCard(
+                segments: chunk,
+                document: document,
+                video: video,
+                configuration: configuration,
+                part: part,
+                of: total
+            ) { result in
+                switch result {
+                case .success(let card):
+                    collected.append(card)
+                    workNext()
+                case .failure(let error) where BackgroundCardRequestPlanner.isContextOverflow(error) && chunk.count > 1:
+                    let mid = max(1, chunk.count / 2)
+                    remaining.insert(contentsOf: [Array(chunk[..<mid]), Array(chunk[mid...])], at: 0)
+                    lastError = error
+                    workNext()
+                case .failure(let error):
+                    lastError = error
+                    if collected.isEmpty, remaining.isEmpty {
+                        completion(.failure(error))
+                    } else {
+                        workNext()
+                    }
+                }
+            }
+        }
+        workNext()
+    }
+
+    private func requestBackgroundCard(
+        segments: [SubtitleSegment],
+        document: TranscriptDocument,
+        video: VideoItem,
+        configuration: TranslationConfiguration,
+        part: Int?,
+        of totalParts: Int,
+        completion: @escaping (Result<VideoBackgroundCard, Error>) -> Void
+    ) {
         let base = configuration.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: "\(base)/chat/completions") else {
             completion(.failure(TranslationError.invalidEndpoint))
             return
         }
 
-        let transcript = document.segments.map { segment -> [String: Any] in
-            [
-                "id": segment.id,
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.original,
-            ]
-        }
         var videoInfo: [String: Any] = [
             "id": video.id,
             "title": video.title,
             "channel": video.channel,
         ]
         if let duration = video.duration { videoInfo["duration"] = duration }
-        guard let sourceData = try? JSONSerialization.data(withJSONObject: [
+        var source: [String: Any] = [
             "video": videoInfo,
             "source_language": document.sourceLanguage,
-            "complete_transcript": transcript,
-        ]), let sourceJSON = String(data: sourceData, encoding: .utf8) else {
+            "transcript": BackgroundCardRequestPlanner.cuePayload(from: segments),
+        ]
+        if let part, totalParts > 1, let first = segments.first, let last = segments.last {
+            source["part"] = part
+            source["part_count"] = totalParts
+            source["part_start"] = first.start
+            source["part_end"] = last.end
+        }
+        guard let sourceData = try? JSONSerialization.data(withJSONObject: source),
+              let sourceJSON = String(data: sourceData, encoding: .utf8) else {
             completion(.failure(TranslationError.malformedResponse))
             return
         }
 
+        let coverage: String
+        if let part, totalParts > 1, let first = segments.first, let last = segments.last {
+            coverage = "This is part \(part) of \(totalParts) of a long video, covering \(Int(first.start))s–\(Int(last.end))s. Analyze only this part. Chapters must stay inside this time range. The overview may be 3-6 sentences for this part."
+        } else {
+            coverage = "Read every supplied cue. The overview must cover the whole video's topic progression in 5-8 sentences, not only the opening."
+        }
         let system = """
-        You analyze a COMPLETE video transcript before subtitle translation. Read every cue and return a concise, evidence-grounded background card in Simplified Chinese.
-        The overview must cover the whole video's topic progression in 5-8 sentences, not only the opening. Do not invent facts. Chapters must be chronological and use numeric seconds from the supplied cue timestamps. Entities and terminology must include only useful recurring items, with exact source spelling, preferred Simplified Chinese, and evidence cue IDs that really contain the item. Flag only plausible ASR or source ambiguities.
+        You analyze a video transcript before subtitle translation. Return a concise, evidence-grounded background card in Simplified Chinese.
+        \(coverage)
+        Do not invent facts. Chapters must be chronological and use numeric seconds from the supplied cue timestamps. Entities and terminology must include only useful recurring items, with exact source spelling, preferred Simplified Chinese, and evidence cue IDs that really contain the item. Flag only plausible ASR or source ambiguities.
         Return only valid JSON with exactly these top-level keys:
         {"overview":"...","chapters":[{"start":0,"end":120,"title":"..."}],"domain":"...","tone":"...","entities":[{"source":"...","preferred_zh":"...","evidence_ids":["cue-id"]}],"terminology":[{"source":"...","preferred_zh":"...","evidence_ids":["cue-id"]}],"uncertainties":[{"cue_id":"cue-id","note":"..."}]}.
         Keep the entire result compact. The overview and card are reference context, never a license to add content absent from a subtitle line.
@@ -253,11 +611,21 @@ final class TranslationService {
                 ["role": "user", "content": sourceJSON],
             ],
         ]
-        TranslationRequestPolicy.applyThinkingMode(
-            to: &payload,
-            model: configuration.model,
-            purpose: .backgroundCard
+        let disableThinking = BackgroundCardRequestPlanner.shouldDisableThinking(
+            characterCount: BackgroundCardRequestPlanner.encodedCharacterCount(for: segments)
         )
+        if disableThinking {
+            let normalized = configuration.model.lowercased()
+            if normalized.contains("qwen3") || normalized.contains("qwen-3") || normalized.contains("deepseek-v4") {
+                payload["enable_thinking"] = false
+            }
+        } else {
+            TranslationRequestPolicy.applyThinkingMode(
+                to: &payload,
+                model: configuration.model,
+                purpose: .backgroundCard
+            )
+        }
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else {
             completion(.failure(TranslationError.malformedResponse))
             return
@@ -270,7 +638,7 @@ final class TranslationService {
         request.httpBody = body
         request.timeoutInterval = TranslationRequestPolicy.backgroundCardTimeout
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        Self.backgroundCardSession.dataTask(with: request) { data, response, error in
             if let error { return completion(.failure(error)) }
             guard let http = response as? HTTPURLResponse, let data else {
                 completion(.failure(TranslationError.malformedResponse))
@@ -293,10 +661,10 @@ final class TranslationService {
                 completion(.failure(TranslationError.malformedResponse))
                 return
             }
-            let validCueIDs = Set(document.segments.map(\.id))
+            let validCueIDs = Set(segments.map(\.id))
             let card = analysis.makeCard(
                 videoID: video.id,
-                segmentCount: document.segments.count,
+                segmentCount: segments.count,
                 validCueIDs: validCueIDs
             )
             guard !card.overview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

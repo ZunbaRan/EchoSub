@@ -87,6 +87,8 @@ struct CoreTests {
     func translationThinkingPolicy() {
         #expect(TranslationRequestPolicy.thinkingMode(model: "qwen3.7-flash", purpose: .translation) == false)
         #expect(TranslationRequestPolicy.thinkingMode(model: "qwen3.7-flash", purpose: .backgroundCard) == true)
+        #expect(TranslationRequestPolicy.thinkingMode(model: "qwen3.8-flash", purpose: .backgroundCard) == true)
+        #expect(TranslationRequestPolicy.thinkingMode(model: "qwen-3.8-flash", purpose: .backgroundCard) == true)
         #expect(TranslationRequestPolicy.thinkingMode(model: "deepseek-v4-flash", purpose: .translation) == false)
         #expect(TranslationRequestPolicy.thinkingMode(model: "gpt-4o-mini", purpose: .translation) == nil)
     }
@@ -95,6 +97,8 @@ struct CoreTests {
     func longVideoTranslationPolicy() {
         #expect(TranslationRequestPolicy.batchSize == 4)
         #expect(TranslationRequestPolicy.translationTimeout == 120)
+        #expect(TranslationRequestPolicy.backgroundCardTimeout == 600)
+        #expect(TranslationRequestPolicy.backgroundCardResourceTimeout == 720)
         #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 1, error: TranslationError.malformedResponse) == 5)
         #expect(TranslationRetryPolicy.delay(afterFailedAttempt: 2, error: TranslationError.malformedResponse) == 15)
     }
@@ -1112,6 +1116,147 @@ struct CoreTests {
         #expect(editing.isEditing(videoID: "video-a", segmentID: "cue-2"))
         editing.end()
         #expect(!editing.isEditing(videoID: "video-a", segmentID: "cue-2"))
+    }
+
+    @Test("Pinned overlay windows stay hidden until the user shows them")
+    func pinnedOverlayDoesNotRaiseHiddenWindow() {
+        #expect(OverlayWindowPresentation.shouldRaisePinnedWindow(isPinned: true, isVisible: true))
+        #expect(!OverlayWindowPresentation.shouldRaisePinnedWindow(isPinned: true, isVisible: false))
+        #expect(!OverlayWindowPresentation.shouldRaisePinnedWindow(isPinned: false, isVisible: true))
+    }
+
+    @Test("Background-card requests target a 1M-token context window")
+    func backgroundCardPlannerUsesMillionTokenWindow() {
+        #expect(BackgroundCardRequestPlanner.modelContextTokens == 1_000_000)
+        #expect(BackgroundCardRequestPlanner.singlePassTokenBudget > 500_000)
+        #expect(BackgroundCardRequestPlanner.estimatedTokens(characterCount: 4_000) == 1_000)
+        #expect(BackgroundCardRequestPlanner.estimatedTokens(characterCount: 72_000) == 18_000)
+
+        let short = (0..<8).map {
+            SubtitleSegment(id: "s\($0)", start: Double($0), end: Double($0) + 1, original: "Hello there.")
+        }
+        let shortPlan = BackgroundCardRequestPlanner.plan(segments: short)
+        #expect(shortPlan.chunks.count == 1)
+        #expect(!shortPlan.disablesThinking)
+
+        let sentence = String(repeating: "This is a spoken sentence from a long podcast episode. ", count: 20)
+        let long = (0..<400).map {
+            SubtitleSegment(id: "s\($0)", start: Double($0) * 5, end: Double($0) * 5 + 4, original: sentence)
+        }
+        let longPlan = BackgroundCardRequestPlanner.plan(segments: long)
+        #expect(longPlan.chunks.count == 1)
+        #expect(!longPlan.disablesThinking)
+        #expect(longPlan.estimatedTokens < BackgroundCardRequestPlanner.singlePassTokenBudget)
+
+        let forced = BackgroundCardRequestPlanner.plan(segments: long, forceChunked: true)
+        #expect(forced.chunks.count == 2)
+        #expect(forced.chunks.flatMap { $0 }.map(\.id) == long.map(\.id))
+
+        let blob = String(repeating: "abcdefghij", count: 1_200)
+        let huge = (0..<400).map {
+            SubtitleSegment(id: "h\($0)", start: Double($0), end: Double($0) + 1, original: blob)
+        }
+        let hugePlan = BackgroundCardRequestPlanner.plan(segments: huge)
+        #expect(hugePlan.estimatedTokens > BackgroundCardRequestPlanner.singlePassTokenBudget)
+        #expect(hugePlan.chunks.count > 1)
+        #expect(hugePlan.chunks.allSatisfy { !$0.isEmpty })
+        #expect(hugePlan.chunks.flatMap { $0 }.map(\.id) == huge.map(\.id))
+        #expect(hugePlan.chunks.allSatisfy {
+            BackgroundCardRequestPlanner.encodedCharacterCount(for: $0) <= BackgroundCardRequestPlanner.chunkCharacterBudget
+                || $0.count == 1
+        })
+    }
+
+    @Test("Background-card context overflow and timeouts are retried by chunking")
+    func backgroundCardRecoverableErrors() {
+        let overflow = TranslationError.requestFailed(
+            statusCode: 400,
+            message: "This model's maximum context length is 128000 tokens",
+            retryAfter: nil
+        )
+        #expect(BackgroundCardRequestPlanner.isContextOverflow(overflow))
+        #expect(BackgroundCardRequestPlanner.isContextOverflow(
+            TranslationError.requestFailed(statusCode: 413, message: "payload too large", retryAfter: nil)
+        ))
+        #expect(BackgroundCardRequestPlanner.isTimeout(URLError(.timedOut)))
+        #expect(BackgroundCardRequestPlanner.isRecoverableByChunking(overflow))
+        #expect(BackgroundCardRequestPlanner.isRecoverableByChunking(URLError(.timedOut)))
+        #expect(!BackgroundCardRequestPlanner.isRecoverableByChunking(TranslationError.notConfigured))
+    }
+
+    @Test("Partial background cards merge into one chronological card")
+    func backgroundCardMergerUnionsPartialAnalyses() {
+        let first = VideoBackgroundCard(
+            videoID: "video",
+            overview: "上半场讨论产品。",
+            chapters: [BackgroundChapter(start: 0, end: 60, title: "开场")],
+            domain: "科技",
+            tone: "访谈",
+            entities: [BackgroundEntity(source: "Ada", preferredTranslation: "艾达", evidenceCueIDs: ["s0"])],
+            terminology: [BackgroundTerm(source: "latency", preferredTranslation: "延迟", evidenceCueIDs: ["s1"])],
+            uncertainties: [],
+            generatedAt: Date(),
+            editedAt: nil,
+            sourceSegmentCount: 10
+        )
+        let second = VideoBackgroundCard(
+            videoID: "video",
+            overview: "下半场讨论部署。",
+            chapters: [BackgroundChapter(start: 90, end: 140, title: "部署")],
+            domain: "",
+            tone: "",
+            entities: [BackgroundEntity(source: "Ada", preferredTranslation: "艾达", evidenceCueIDs: ["s9"])],
+            terminology: [BackgroundTerm(source: "rollout", preferredTranslation: "放量", evidenceCueIDs: ["s11"])],
+            uncertainties: [BackgroundUncertainty(cueID: "s12", note: "专有名词可能听写错误")],
+            generatedAt: Date(),
+            editedAt: nil,
+            sourceSegmentCount: 10
+        )
+        let merged = BackgroundCardMerger.merge([first, second], videoID: "video", segmentCount: 20)
+        #expect(merged.overview.contains("上半场"))
+        #expect(merged.overview.contains("下半场"))
+        #expect(merged.chapters.map(\.title) == ["开场", "部署"])
+        #expect(merged.domain == "科技")
+        #expect(merged.entities.count == 1)
+        #expect(Set(merged.entities[0].evidenceCueIDs) == ["s0", "s9"])
+        #expect(merged.terminology.map(\.source).sorted() == ["latency", "rollout"])
+        #expect(merged.sourceSegmentCount == 20)
+    }
+
+    @Test("Supadata placeholder titles are replaced with YouTube metadata")
+    func youtubeMetadataFillsPlaceholderTitles() throws {
+        #expect(YouTubePageMetadata.isPlaceholderTitle("YouTube 视频"))
+        #expect(YouTubePageMetadata.isPlaceholderTitle("   "))
+        #expect(!YouTubePageMetadata.isPlaceholderTitle("Lex Fridman Podcast #400"))
+        #expect(YouTubePageMetadata.oEmbedURL(for: "dQw4w9WgXcQ").absoluteString.contains("dQw4w9WgXcQ"))
+
+        let oEmbed = """
+        {"title":"Never Gonna Give You Up","author_name":"Rick Astley","type":"video"}
+        """.data(using: .utf8)!
+        let snapshot = try #require(YouTubePageMetadata.parseOEmbed(data: oEmbed))
+        #expect(snapshot.title == "Never Gonna Give You Up")
+        #expect(snapshot.channel == "Rick Astley")
+
+        let fetched = TranscriptFetchResult(
+            document: TranscriptDocument(videoID: "dQw4w9WgXcQ", sourceLanguage: "en", isGenerated: false, segments: []),
+            title: VideoItem.placeholderTitle,
+            channel: VideoItem.placeholderChannel,
+            duration: nil
+        )
+        #expect(fetched.needsMetadataEnrichment)
+        let enriched = fetched.applying(snapshot)
+        #expect(enriched.title == "Never Gonna Give You Up")
+        #expect(enriched.channel == "Rick Astley")
+
+        let html = """
+        <html><head>
+        <meta property="og:title" content="Episode 12: Deep Work">
+        <link itemprop="name" content="Cal Newport">
+        </head><body></body></html>
+        """
+        let page = YouTubePageMetadata.parseWatchPage(html)
+        #expect(page.title == "Episode 12: Deep Work")
+        #expect(page.channel == "Cal Newport")
     }
 }
 
