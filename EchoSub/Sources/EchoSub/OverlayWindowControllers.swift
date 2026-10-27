@@ -34,22 +34,29 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     private let selectionPresenter = SelectionActionPresenter.shared
     private var selectionContext: VocabularySelectionContext?
     private var suppressNextSubtitleSeek = false
+    private var glassSurface: NSView?
 
     init() {
+        // A utility titlebar uses 10pt traffic lights in a 24pt bar. The
+        // floating subtitle window wants the standard 14pt buttons and a
+        // taller bar, so it keeps only the regular window styles.
         let panel = VocabularyFloatingPanel(
             contentRect: NSRect(x: 0, y: 0, width: 470, height: 320),
-            styleMask: [.titled, .closable, .resizable, .utilityWindow, .fullSizeContentView],
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
+        // Utility windows are excluded from the Window menu; keep that behavior.
+        panel.isExcludedFromWindowsMenu = true
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isOpaque = false
         panel.backgroundColor = .clear
         // With a fully transparent background, the system window shadow is
         // derived from subtitle glyphs and can retain stale glyph silhouettes
-        // as the table scrolls. The subtitle cells provide their own highlight.
-        panel.hasShadow = false
+        // as the table scrolls. Liquid Glass paints a continuous surface, so
+        // the shadow stays a stable rounded rect and can be kept for depth.
+        panel.hasShadow = LiquidGlass.isAvailable
         panel.minSize = NSSize(width: 320, height: 200)
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
@@ -68,6 +75,12 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     private func buildInterface() {
         guard let content = window?.contentView else { return }
         content.wantsLayer = true
+
+        let surface = LiquidGlass.surface()
+        surface.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(surface)
+        surface.pinEdges(to: content)
+        glassSurface = surface
         applyBackgroundOpacity(settings.floatingBackgroundOpacity)
 
         pinButton.target = self
@@ -99,7 +112,7 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
         opacitySlider.controlSize = .mini
         opacitySlider.target = self
         opacitySlider.action = #selector(opacityChanged(_:))
-        opacitySlider.toolTip = "悬浮字幕背景透明度"
+        opacitySlider.toolTip = LiquidGlass.isAvailable ? "悬浮字幕玻璃染色强度（最左为关闭背景）" : "悬浮字幕背景透明度"
         opacitySlider.translatesAutoresizingMaskIntoConstraints = false
         opacitySlider.widthAnchor.constraint(equalToConstant: 100).isActive = true
         let opacityBar = NSStackView(views: [NSView(), opacityIcon, opacitySlider])
@@ -229,8 +242,15 @@ final class FloatingSubtitleWindowController: NSWindowController, NSWindowDelega
     }
 
     private func applyBackgroundOpacity(_ opacity: Double) {
-        window?.contentView?.wantsLayer = true
-        window?.contentView?.layer?.backgroundColor = EchoStyle.windowBackground.withAlphaComponent(CGFloat(min(1, max(0, opacity)))).cgColor
+        guard let glassSurface else { return }
+        let value = min(1, max(0, opacity))
+        // The far-left stop keeps the original fully transparent mode; a clear
+        // glass surface would still blur the video behind it.
+        glassSurface.isHidden = value <= 0.001
+        // Without a painted surface the window shadow would follow the glyph
+        // silhouettes again, so it only exists while the glass is visible.
+        window?.hasShadow = LiquidGlass.isAvailable && value > 0.001
+        LiquidGlass.applyTint(value, to: glassSurface)
     }
 
     private func setPinned(_ pinned: Bool) {
@@ -585,7 +605,7 @@ final class TransparentSubtitleScrollView: NSScrollView {
 final class DesktopLyricsWindowController: NSWindowController, NSWindowDelegate {
     private let state = AppState.shared
     private let settings = AppSettings.shared
-    private let plate = NSVisualEffectView()
+    private let plate = LiquidGlass.hudSurface()
     private let original = EchoStyle.label("等待视频播放…", size: 27, weight: .bold, lines: 0)
     private let translation = EchoStyle.label("", size: 17, color: EchoStyle.textSecondary, lines: 0)
     private let controls = NSStackView()
@@ -596,7 +616,7 @@ final class DesktopLyricsWindowController: NSWindowController, NSWindowDelegate 
     private var previousWidth: CGFloat = 0
 
     init() {
-        let panel = NSPanel(
+        let panel = LiquidGlassPanel(
             contentRect: NSRect(x: 0, y: 0, width: 570, height: 158),
             styleMask: [.titled, .resizable, .utilityWindow, .fullSizeContentView, .nonactivatingPanel],
             backing: .buffered,
@@ -650,7 +670,7 @@ final class DesktopLyricsWindowController: NSWindowController, NSWindowDelegate 
         opacitySlider.controlSize = .mini
         opacitySlider.target = self
         opacitySlider.action = #selector(opacityChanged(_:))
-        opacitySlider.toolTip = "背景透明度（最左为完全透明）"
+        opacitySlider.toolTip = LiquidGlass.isAvailable ? "液态玻璃染色强度（最左为关闭背景）" : "背景透明度（最左为完全透明）"
         opacitySlider.translatesAutoresizingMaskIntoConstraints = false
         opacitySlider.widthAnchor.constraint(equalToConstant: 70).isActive = true
         let lock = EchoStyle.iconButton("lock", help: "锁定并穿透鼠标", target: self, action: #selector(toggleLock))
@@ -664,15 +684,18 @@ final class DesktopLyricsWindowController: NSWindowController, NSWindowDelegate 
         controls.layer?.cornerRadius = 8
         controls.edgeInsets = NSEdgeInsets(top: 3, left: 5, bottom: 3, right: 5)
         controls.translatesAutoresizingMaskIntoConstraints = false
+        // NSGlassEffectView prefers a minimal surface height. Without a pinned
+        // control bar, Auto Layout stretches the bar and collapses the glass.
+        let controlsHeight = controls.heightAnchor.constraint(
+            equalToConstant: max(34, controls.fittingSize.height)
+        )
+        controlsHeight.priority = NSLayoutConstraint.Priority(999)
+        controlsHeight.isActive = true
 
-        plate.material = .hudWindow
-        plate.blendingMode = .behindWindow
-        plate.state = .active
-        plate.wantsLayer = true
-        plate.layer?.cornerRadius = 13
-        plate.layer?.masksToBounds = true
-        plate.layer?.borderWidth = 1
-        plate.layer?.borderColor = NSColor.white.withAlphaComponent(0.28).cgColor
+        if !LiquidGlass.isAvailable {
+            plate.layer?.borderWidth = 1
+            plate.layer?.borderColor = NSColor.white.withAlphaComponent(0.28).cgColor
+        }
         plate.translatesAutoresizingMaskIntoConstraints = false
         original.alignment = .left
         translation.alignment = .left
@@ -755,13 +778,19 @@ final class DesktopLyricsWindowController: NSWindowController, NSWindowDelegate 
             font: .systemFont(ofSize: CGFloat(settings.desktopChineseFontSize), weight: .regular),
             color: settings.chineseSubtitleColor
         )
+        // An empty label still reserves a line in the stack and pushes the
+        // English line out of the glass plate.
+        translation.isHidden = translatedText.isEmpty
     }
 
     private func updateBackgroundOpacity(_ opacity: Double) {
         let value = CGFloat(min(1, max(0, opacity)))
         plate.isHidden = value <= 0.001
-        plate.alphaValue = value
-        plate.layer?.borderColor = isLocked ? NSColor.clear.cgColor : NSColor.white.withAlphaComponent(0.28 * value).cgColor
+        LiquidGlass.applyTint(Double(value), to: plate)
+        // Liquid Glass 自带上边缘高光，只有旧版磨砂底板需要手动描边。
+        if !LiquidGlass.isAvailable {
+            plate.layer?.borderColor = isLocked ? NSColor.clear.cgColor : NSColor.white.withAlphaComponent(0.28 * value).cgColor
+        }
     }
 
     private func resizeHeightForContent() {

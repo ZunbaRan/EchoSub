@@ -506,11 +506,25 @@ struct CoreTests {
         #expect(scroll.lastInvalidatedDocumentRect.intersects(scroll.documentVisibleRect))
     }
 
-    @Test("Fully transparent floating subtitles do not use a glyph-shaped window shadow")
+    @Test("Floating subtitle window keeps its shadow only over a painted surface")
     @MainActor
-    func floatingSubtitleWindowDisablesSystemShadow() {
+    func floatingSubtitleWindowShadowMatchesSurface() {
         let controller = FloatingSubtitleWindowController()
-        #expect(controller.window?.hasShadow == false)
+        // Liquid Glass paints a continuous surface, so the shadow can no longer
+        // take the shape of scrolling subtitle glyphs.
+        #expect(controller.window?.hasShadow == LiquidGlass.isAvailable)
+    }
+
+    @Test("Glass tint scales the legacy background opacity instead of going opaque")
+    func glassTintScalesLegacyOpacity() {
+        #expect(LiquidGlass.tintColor(forBackgroundOpacity: 0) == nil)
+        let defaultTint = LiquidGlass.tintColor(forBackgroundOpacity: 0.96)
+        #expect(defaultTint != nil)
+        #expect(defaultTint!.alphaComponent > 0.2)
+        #expect(defaultTint!.alphaComponent < 0.5)
+        let soft = LiquidGlass.tintColor(forBackgroundOpacity: 0.3)!.alphaComponent
+        let strong = LiquidGlass.tintColor(forBackgroundOpacity: 0.8)!.alphaComponent
+        #expect(soft < strong)
     }
 
     @Test("Hidden videos stay persisted but disappear from the active playlist")
@@ -1257,6 +1271,42 @@ struct CoreTests {
         let page = YouTubePageMetadata.parseWatchPage(html)
         #expect(page.title == "Episode 12: Deep Work")
         #expect(page.channel == "Cal Newport")
+    }
+
+    @Test("Timedtext parser accepts JSON3 and both XML formats")
+    func timedTextParserAcceptsJSON3AndXML() throws {
+        let json = """
+        {"events":[{"tStartMs":1000,"dDurationMs":2000,"segs":[{"utf8":"Hello"},{"utf8":" world"}]}]}
+        """.data(using: .utf8)!
+        let jsonCues = try #require(TimedTextCueParser.cues(from: json))
+        #expect(jsonCues.count == 1)
+        #expect(jsonCues[0].text == "Hello world")
+        #expect(abs(jsonCues[0].start - 1.0) < 1e-6)
+        #expect(abs(jsonCues[0].duration - 2.0) < 1e-6)
+
+        // The Android InnerTube client returns format 3 XML even when fmt=json3
+        // is requested; <p> timestamps are milliseconds.
+        let xml3 = """
+        <?xml version="1.0" encoding="utf-8" ?><timedtext format="3"><body>
+        <p t="240" d="5760"><s>The</s><s> theory</s></p>
+        <p t="8000" d="2000">works</p>
+        </body></timedtext>
+        """.data(using: .utf8)!
+        let xmlCues = try #require(TimedTextCueParser.cues(from: xml3))
+        #expect(xmlCues.count == 2)
+        #expect(xmlCues[0].text == "The theory")
+        #expect(abs(xmlCues[0].start - 0.24) < 1e-6)
+        #expect(abs(xmlCues[0].duration - 5.76) < 1e-6)
+
+        let legacy = """
+        <?xml version="1.0" encoding="utf-8" ?><transcript>
+        <text start="1.2" dur="3.4">Legacy cue</text>
+        </transcript>
+        """.data(using: .utf8)!
+        let legacyCues = try #require(TimedTextCueParser.cues(from: legacy))
+        #expect(legacyCues.count == 1)
+        #expect(legacyCues[0].text == "Legacy cue")
+        #expect(abs(legacyCues[0].start - 1.2) < 1e-6)
     }
 }
 

@@ -16,6 +16,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     private let followButton = EchoStyle.iconButton("scope", help: "自动跟随", target: nil, action: nil)
     private let backgroundCardButton = EchoStyle.button("背景卡", symbol: "sparkles", target: nil, action: nil)
     private let vocabularyButton = EchoStyle.button("本片词汇 0", symbol: "text.book.closed", target: nil, action: nil)
+    private var backgroundCardButtonTitle = "背景卡"
+    private var vocabularyButtonTitle = "本片词汇 0"
     private let subtitleFooter = EchoStyle.label("", size: 11, color: EchoStyle.textTertiary)
     private let playlistContainer = NSView()
     private let subtitleContainer = NSView()
@@ -30,7 +32,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     private let hiddenPlaylistButton = EchoStyle.button("已隐藏", symbol: "archivebox", target: nil, action: nil)
     private let playButton = EchoStyle.iconButton("play.fill", help: "播放 / 暂停", target: nil, action: nil)
     private let loopButton = EchoStyle.iconButton("repeat", help: "循环：关闭", target: nil, action: nil)
+    private let floatButton = EchoStyle.button("悬浮字幕", symbol: "rectangle.on.rectangle", target: nil, action: nil)
+    private let lyricButton = EchoStyle.button("桌面歌词", symbol: "text.bubble", target: nil, action: nil)
     private var splitView: NSSplitView!
+    private var windowGlassSurface: NSView?
     private var currentSubtitleRow = -1
     private var autoFollow = true
     private var isPlaying = false
@@ -70,7 +75,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         window.title = "EchoSub"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
-        window.backgroundColor = EchoStyle.windowBackground
+        if LiquidGlass.isAvailable {
+            window.isOpaque = false
+            window.backgroundColor = .clear
+        } else {
+            window.backgroundColor = EchoStyle.windowBackground
+        }
         window.minSize = NSSize(width: 900, height: 600)
         window.setFrameAutosaveName("EchoSub.main")
         super.init(window: window)
@@ -96,7 +106,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
     private func buildInterface() {
         guard let content = window?.contentView else { return }
         content.wantsLayer = true
-        content.layer?.backgroundColor = EchoStyle.windowBackground.cgColor
+        if LiquidGlass.isAvailable {
+            content.layer?.backgroundColor = NSColor.clear.cgColor
+            let surface = LiquidGlass.surface()
+            surface.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(surface)
+            surface.pinEdges(to: content)
+            windowGlassSurface = surface
+            applyWindowTransparency()
+        } else {
+            content.layer?.backgroundColor = EchoStyle.windowBackground.cgColor
+        }
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -129,11 +149,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         DispatchQueue.main.async { [weak self] in self?.applyInitialSplitLayout() }
     }
 
+    private func applyWindowTransparency() {
+        guard let windowGlassSurface else { return }
+        LiquidGlass.applyWindowTint(settings.mainWindowBackgroundOpacity, to: windowGlassSurface)
+    }
+
     private func makeTopBar() -> NSView {
-        let bar = NSVisualEffectView()
-        bar.material = .headerView
-        bar.blendingMode = .withinWindow
-        bar.state = .active
+        let bar: NSView
+        if LiquidGlass.isAvailable {
+            // Let the window glass show through the chrome instead of stacking
+            // a second material above it.
+            let clear = NSView()
+            clear.wantsLayer = true
+            clear.layer?.backgroundColor = NSColor.clear.cgColor
+            bar = clear
+        } else {
+            let effect = NSVisualEffectView()
+            effect.material = .headerView
+            effect.blendingMode = .withinWindow
+            effect.state = .active
+            bar = effect
+        }
         bar.translatesAutoresizingMaskIntoConstraints = false
         bar.heightAnchor.constraint(equalToConstant: 52).isActive = true
 
@@ -317,8 +353,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         playButton.target = self
         playButton.action = #selector(togglePlayback)
         let forward = EchoStyle.iconButton("goforward.5", help: "前进 5 秒", target: self, action: #selector(forwardFive))
-        let floatButton = EchoStyle.button("悬浮字幕", symbol: "rectangle.on.rectangle", target: self, action: #selector(toggleFloating))
-        let lyricButton = EchoStyle.button("桌面歌词", symbol: "text.bubble", target: self, action: #selector(toggleLyrics))
+        floatButton.target = self
+        floatButton.action = #selector(toggleFloating)
+        lyricButton.target = self
+        lyricButton.action = #selector(toggleLyrics)
         nativeFullscreenButton.target = self
         nativeFullscreenButton.action = #selector(togglePlayerFullscreen)
         let external = EchoStyle.iconButton("arrow.up.right.square", help: "在 YouTube 打开", target: self, action: #selector(openYouTube))
@@ -331,8 +369,39 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         stack.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(stack)
         stack.pinEdges(to: bar, insets: NSEdgeInsets(top: 8, left: 0, bottom: 6, right: 0))
-        titles.widthAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
+        // Let the video title truncate before any control is clipped.
+        let titleWidth = titles.widthAnchor.constraint(greaterThanOrEqualToConstant: 60)
+        titleWidth.priority = .defaultLow
+        titleWidth.isActive = true
+        titles.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return bar
+    }
+
+    /// The three-column layout can be dragged much narrower than the labels in
+    /// the subtitle header and player bar. Keep the mode control intact and
+    /// degrade the secondary actions to icon-only instead of clipping them.
+    private func updateResponsiveLayout() {
+        let subtitleWidth = subtitleContainer.frame.width
+        let compactIcons = subtitleWidth > 0 && subtitleWidth < 480
+        let hiddenActions = subtitleWidth > 0 && subtitleWidth < 340
+        vocabularyButton.isHidden = hiddenActions
+        backgroundCardButton.isHidden = hiddenActions
+        vocabularyButton.imagePosition = compactIcons ? .imageOnly : .imageLeading
+        backgroundCardButton.imagePosition = compactIcons ? .imageOnly : .imageLeading
+        vocabularyButton.title = compactIcons ? "" : vocabularyButtonTitle
+        backgroundCardButton.title = compactIcons ? "" : backgroundCardButtonTitle
+        vocabularyButton.toolTip = vocabularyButtonTitle
+        backgroundCardButton.toolTip = "背景卡"
+        modeControl.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let centerWidth = playerContainer.superview?.frame.width ?? 0
+        let compactBar = centerWidth > 0 && centerWidth < 520
+        floatButton.title = compactBar ? "" : "悬浮字幕"
+        floatButton.imagePosition = compactBar ? .imageOnly : .imageLeading
+        floatButton.toolTip = "悬浮字幕"
+        lyricButton.title = compactBar ? "" : "桌面歌词"
+        lyricButton.imagePosition = compactBar ? .imageOnly : .imageLeading
+        lyricButton.toolTip = "桌面歌词"
     }
 
     private func makeSubtitlePanel() -> NSView {
@@ -358,6 +427,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         backgroundCardButton.action = #selector(showBackgroundCard)
         backgroundCardButton.isBordered = false
         backgroundCardButton.contentTintColor = EchoStyle.textSecondary
+        // Keep a comfortable hit target when the labels collapse to icons.
+        vocabularyButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 28).isActive = true
+        vocabularyButton.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        backgroundCardButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 28).isActive = true
+        backgroundCardButton.heightAnchor.constraint(equalToConstant: 28).isActive = true
         let more = EchoStyle.iconButton("ellipsis", help: "翻译选项", target: self, action: #selector(showTranslationMenu(_:)))
         let header = NSStackView(views: [title, modeControl, NSView(), vocabularyButton, backgroundCardButton, followButton, more])
         header.orientation = .horizontal
@@ -467,7 +541,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         observers.append(center.addObserver(forName: .echoVocabularyChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshVocabulary() })
         observers.append(center.addObserver(forName: .echoBackgroundCardChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshBackgroundCard() })
         observers.append(center.addObserver(forName: .echoPlaybackTimeChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshPlaybackPosition() })
-        observers.append(center.addObserver(forName: .echoSettingsChanged, object: nil, queue: .main) { [weak self] _ in self?.refreshSubtitleAppearance() })
+        observers.append(center.addObserver(forName: .echoSettingsChanged, object: nil, queue: .main) { [weak self] _ in
+            self?.applyWindowTransparency()
+            self?.refreshSubtitleAppearance()
+        })
         observers.append(center.addObserver(forName: .echoSeekRequested, object: nil, queue: .main) { [weak self] note in
             guard let seconds = note.object as? Double else { return }
             self?.playerView.seek(to: seconds)
@@ -588,11 +665,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
                 error: state.currentBackgroundCardError
             )
         }
+        backgroundCardButtonTitle = backgroundCardButton.title
         refreshTranscript()
+        updateResponsiveLayout()
     }
 
     private func refreshVocabulary() {
-        vocabularyButton.title = "本片词汇 \(state.currentVocabularyCount)"
+        vocabularyButtonTitle = "本片词汇 \(state.currentVocabularyCount)"
+        vocabularyButton.title = vocabularyButtonTitle
         vocabularyButton.isEnabled = state.currentTranscript != nil
         vocabularyButton.contentTintColor = state.currentVocabularyCount > 0 ? EchoStyle.accent : EchoStyle.textSecondary
         if !vocabularyPanel.isHidden {
@@ -600,6 +680,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         }
         invalidateSubtitleRowHeights()
         subtitleTable.reloadData()
+        updateResponsiveLayout()
     }
 
     private func refreshPlaybackPosition() {
@@ -911,6 +992,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         }
         playlistToggleButton.contentTintColor = playlistCollapsed ? EchoStyle.textSecondary : EchoStyle.accent
         playlistToggleButton.toolTip = playlistCollapsed ? "展开播放列表" : "折叠播放列表"
+        updateResponsiveLayout()
     }
 
     @objc private func toggleSubtitles() { setSubtitlesCollapsed(!subtitleCollapsed) }
@@ -919,7 +1001,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         guard let splitView, collapsed != subtitleCollapsed else { return }
         isApplyingSplitLayout = true
         if collapsed {
-            lastSubtitleWidth = max(280, subtitleContainer.frame.width)
+            lastSubtitleWidth = max(300, subtitleContainer.frame.width)
             subtitleCollapsed = true
             splitView.setPosition(splitView.bounds.width, ofDividerAt: 1)
             subtitleContainer.isHidden = true
@@ -929,13 +1011,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             subtitleContainer.isHidden = false
             splitView.adjustSubviews()
             let left = playlistCollapsed ? 0 : max(180, playlistContainer.frame.width)
-            let available = max(280, splitView.bounds.width - left - 360 - splitView.dividerThickness * 2)
+            let available = max(300, splitView.bounds.width - left - 360 - splitView.dividerThickness * 2)
             let width = min(lastSubtitleWidth, available)
             splitView.setPosition(splitView.bounds.width - width - splitView.dividerThickness, ofDividerAt: 1)
         }
         isApplyingSplitLayout = false
         subtitleToggleButton.contentTintColor = subtitleCollapsed ? EchoStyle.textSecondary : EchoStyle.accent
         subtitleToggleButton.toolTip = subtitleCollapsed ? "展开字幕" : "折叠字幕"
+        updateResponsiveLayout()
     }
     @objc private func togglePlayback() { playerView.togglePlayback() }
     @objc private func backFive() { playerView.skip(by: -5) }
@@ -1296,6 +1379,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         let log = NSMenuItem(title: "打开翻译诊断日志", action: #selector(openTranslationDiagnosticLog), keyEquivalent: "")
         log.target = self
         menu.addItem(log)
+        // The subtitle header hides these two labels when the panel is narrow;
+        // keep them reachable from the same overflow menu.
+        if vocabularyButton.isHidden || backgroundCardButton.isHidden {
+            menu.addItem(.separator())
+            if vocabularyButton.isHidden {
+                let vocab = NSMenuItem(title: "本片词汇 \(state.currentVocabularyCount)", action: #selector(showVocabulary), keyEquivalent: "")
+                vocab.target = self
+                vocab.isEnabled = state.currentTranscript != nil
+                menu.addItem(vocab)
+            }
+            if backgroundCardButton.isHidden {
+                let card = NSMenuItem(title: "背景卡", action: #selector(showBackgroundCard), keyEquivalent: "")
+                card.target = self
+                card.isEnabled = state.currentTranscript != nil
+                menu.addItem(card)
+            }
+        }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY - 2), in: sender)
     }
     @objc private func fillMissingTranslations() { state.translateMissing() }
@@ -1490,13 +1590,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
         let leftValue = defaults.object(forKey: "mainPlaylistWidth") == nil ? 236 : defaults.double(forKey: "mainPlaylistWidth")
         let rightValue = defaults.object(forKey: "mainSubtitleWidth") == nil ? 348 : defaults.double(forKey: "mainSubtitleWidth")
         let left = min(360, max(180, CGFloat(leftValue)))
-        let right = min(520, max(280, CGFloat(rightValue)))
+        let right = min(520, max(300, CGFloat(rightValue)))
         lastPlaylistWidth = left
         lastSubtitleWidth = right
         splitView.setPosition(left, ofDividerAt: 0)
         splitView.setPosition(splitView.bounds.width - right - splitView.dividerThickness, ofDividerAt: 1)
         splitView.layoutSubtreeIfNeeded()
         invalidateSubtitleRowHeights()
+        // The split view only reaches its final width after this pass.
+        DispatchQueue.main.async { [weak self] in self?.updateResponsiveLayout() }
     }
 
     func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
@@ -1511,10 +1613,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
 
     func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
         if dividerIndex == 0 {
-            let right = subtitleCollapsed ? 0 : max(280, splitView.subviews[safe: 2]?.frame.width ?? lastSubtitleWidth)
+            let right = subtitleCollapsed ? 0 : max(300, splitView.subviews[safe: 2]?.frame.width ?? lastSubtitleWidth)
             return min(360, splitView.bounds.width - 360 - right - splitView.dividerThickness * 2)
         }
-        return subtitleCollapsed ? splitView.bounds.width : splitView.bounds.width - 280 - splitView.dividerThickness
+        return subtitleCollapsed ? splitView.bounds.width : splitView.bounds.width - 300 - splitView.dividerThickness
     }
 
     func splitViewDidResizeSubviews(_ notification: Notification) {
@@ -1525,11 +1627,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSSplitV
             lastPlaylistWidth = left
             UserDefaults.standard.set(Double(left), forKey: "mainPlaylistWidth")
         }
-        if !subtitleCollapsed, right >= 280 {
+        if !subtitleCollapsed, right >= 300 {
             lastSubtitleWidth = right
             UserDefaults.standard.set(Double(right), forKey: "mainSubtitleWidth")
         }
         invalidateSubtitleRowHeights()
+        updateResponsiveLayout()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        updateResponsiveLayout()
     }
 
     func windowWillClose(_ notification: Notification) {

@@ -34,6 +34,7 @@ final class YTDLPTranscriptProvider {
             candidates.append(contentsOf: path.split(separator: ":").map { "\($0)/yt-dlp" })
         }
         candidates.append(contentsOf: [
+            "\(NSHomeDirectory())/.local/bin/yt-dlp",
             "/opt/homebrew/bin/yt-dlp",
             "/usr/local/bin/yt-dlp",
             "/usr/bin/yt-dlp",
@@ -110,18 +111,10 @@ final class YTDLPTranscriptProvider {
                 return
             }
             guard let data,
-                  let root = try? JSONDecoder().decode(YTDLPJSON3Root.self, from: data) else {
+                  let cues = TimedTextCueParser.cues(from: data),
+                  !cues.isEmpty else {
                 completion(.failure(SubtitleFallbackError.ytDLPFailed("字幕数据格式无法识别。")))
                 return
-            }
-            let cues = root.events.compactMap { event -> RawCaptionCue? in
-                let text = SubtitleSegmenter.normalize(event.segs?.compactMap(\.utf8).joined() ?? "")
-                guard !text.isEmpty else { return nil }
-                return RawCaptionCue(
-                    text: text,
-                    start: Double(event.tStartMs ?? 0) / 1_000,
-                    duration: Double(event.dDurationMs ?? 0) / 1_000
-                )
             }
             let segments = SubtitleSegmenter.group(cues)
             guard !segments.isEmpty else {
@@ -294,14 +287,6 @@ private struct YTDLPFormat: Decodable {
     var ext: String
     var url: String
 }
-
-private struct YTDLPJSON3Root: Decodable { var events: [YTDLPJSON3Event] }
-private struct YTDLPJSON3Event: Decodable {
-    var tStartMs: Int?
-    var dDurationMs: Int?
-    var segs: [YTDLPJSON3Segment]?
-}
-private struct YTDLPJSON3Segment: Decodable { var utf8: String? }
 
 private struct SupadataEnvelope: Decodable {
     var content: [SupadataChunk]?

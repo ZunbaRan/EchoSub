@@ -402,7 +402,7 @@ enum VocabularyShortcutPolicy {
     }
 }
 
-final class VocabularyFloatingPanel: NSPanel {
+final class VocabularyFloatingPanel: LiquidGlassPanel {
     var onGlossShortcut: (() -> Bool)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {

@@ -222,13 +222,29 @@ final class YouTubeTranscriptService {
                 completion(.failure(TranscriptServiceError.invalidWatchPage))
                 return
             }
+            let apiKey = Self.firstMatch(#"\"INNERTUBE_API_KEY\":\"([^\"]+)\""#, in: html)
             if let embedded = Self.embeddedPlayerResponse(in: html),
                embedded.playabilityStatus.status == "OK",
                embedded.captions?.playerCaptionsTracklistRenderer.captionTracks.isEmpty == false {
-                self?.finish(videoID: videoID, response: embedded, completion: completion)
+                guard let self else {
+                    completion(.failure(TranscriptServiceError.invalidWatchPage))
+                    return
+                }
+                self.finish(videoID: videoID, response: embedded) { result in
+                    switch result {
+                    case .success:
+                        completion(result)
+                    case .failure:
+                        // The web player response still lists caption tracks, but
+                        // its timedtext URL now returns an empty body. Retry with
+                        // the Android client before falling back to yt-dlp.
+                        guard let apiKey else { completion(result); return }
+                        self.fetchPlayer(videoID: videoID, apiKey: apiKey, completion: completion)
+                    }
+                }
                 return
             }
-            guard let apiKey = Self.firstMatch(#"\"INNERTUBE_API_KEY\":\"([^\"]+)\""#, in: html) else {
+            guard let apiKey else {
                 completion(.failure(TranscriptServiceError.invalidWatchPage))
                 return
             }
@@ -313,19 +329,9 @@ final class YouTubeTranscriptService {
 
         session.dataTask(with: url) { data, _, error in
             if let error { return completion(.failure(TranscriptServiceError.network(error))) }
-            guard let data,
-                  let root = try? JSONDecoder().decode(JSON3Root.self, from: data) else {
+            guard let data, let cues = TimedTextCueParser.cues(from: data) else {
                 completion(.failure(TranscriptServiceError.malformedResponse))
                 return
-            }
-            let cues = root.events.compactMap { event -> RawCaptionCue? in
-                let text = SubtitleSegmenter.normalize(event.segs?.compactMap(\.utf8).joined() ?? "")
-                guard !text.isEmpty else { return nil }
-                return RawCaptionCue(
-                    text: text,
-                    start: Double(event.tStartMs ?? 0) / 1_000,
-                    duration: Double(event.dDurationMs ?? 0) / 1_000
-                )
             }
             completion(cues.isEmpty ? .failure(TranscriptServiceError.noSubtitles) : .success(cues))
         }.resume()
@@ -414,18 +420,4 @@ private struct VideoDetails: Decodable {
     var title: String?
     var author: String?
     var lengthSeconds: String?
-}
-
-private struct JSON3Root: Decodable {
-    var events: [JSON3Event]
-}
-
-private struct JSON3Event: Decodable {
-    var tStartMs: Int?
-    var dDurationMs: Int?
-    var segs: [JSON3Segment]?
-}
-
-private struct JSON3Segment: Decodable {
-    var utf8: String?
 }

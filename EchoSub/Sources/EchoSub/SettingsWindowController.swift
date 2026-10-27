@@ -50,7 +50,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTa
             defer: false
         )
         window.title = "EchoSub 设置"
-        window.backgroundColor = EchoStyle.windowBackground
+        if LiquidGlass.isAvailable {
+            window.isOpaque = false
+            window.backgroundColor = .clear
+        } else {
+            window.backgroundColor = EchoStyle.windowBackground
+        }
         window.setFrameAutosaveName("EchoSub.settings")
         super.init(window: window)
         window.delegate = self
@@ -73,7 +78,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTa
     private func buildInterface() {
         guard let root = window?.contentView else { return }
         root.wantsLayer = true
-        root.layer?.backgroundColor = EchoStyle.windowBackground.cgColor
+        if LiquidGlass.isAvailable {
+            root.layer?.backgroundColor = NSColor.clear.cgColor
+            let surface = LiquidGlass.surface()
+            surface.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(surface)
+            surface.pinEdges(to: root)
+            LiquidGlass.applyWindowTint(to: surface)
+        } else {
+            root.layer?.backgroundColor = EchoStyle.windowBackground.cgColor
+        }
         let split = NSSplitView()
         split.isVertical = true
         split.dividerStyle = .thin
@@ -265,6 +279,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTa
         let lyricsOpacity = NSSlider(value: settings.desktopLyricsBackgroundOpacity, minValue: 0, maxValue: 1, target: self, action: #selector(lyricsOpacityChanged(_:)))
         lyricsOpacity.isContinuous = true
         lyricsOpacity.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        let mainOpacity = NSSlider(value: settings.mainWindowBackgroundOpacity, minValue: 0, maxValue: 1, target: self, action: #selector(mainWindowOpacityChanged(_:)))
+        mainOpacity.isContinuous = true
+        mainOpacity.isEnabled = LiquidGlass.isAvailable
+        mainOpacity.widthAnchor.constraint(equalToConstant: 220).isActive = true
 
         let palette = NSPopUpButton()
         palette.addItems(withTitles: SubtitlePalette.presets.map(\.name) + ["自定义"])
@@ -285,8 +303,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTa
         return form([
             row("悬浮字幕字号", control: slider),
             row("桌面歌词字号", detail: "英文与中文分别调节", control: sizes),
-            row("悬浮字幕背景", detail: "最左为完全透明", control: floatingOpacity),
-            row("桌面歌词背景", detail: "最左为完全透明", control: lyricsOpacity),
+            row("悬浮字幕背景", detail: LiquidGlass.isAvailable ? "液态玻璃的染色强度" : "最左为完全透明", control: floatingOpacity),
+            row("桌面歌词背景", detail: LiquidGlass.isAvailable ? "液态玻璃的染色强度" : "最左为完全透明", control: lyricsOpacity),
+            row("主窗口透明度", detail: LiquidGlass.isAvailable ? "液态玻璃染色强度，越左越通透" : "当前系统使用深色背景", control: mainOpacity),
             row("字幕配色预设", control: palette),
             row("英文字体颜色", control: englishColor),
             row("中文字体颜色", control: chineseColor),
@@ -411,6 +430,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTa
     @objc private func desktopChineseFontChanged(_ sender: NSSlider) { settings.desktopChineseFontSize = sender.doubleValue }
     @objc private func floatingOpacityChanged(_ sender: NSSlider) { settings.floatingBackgroundOpacity = sender.doubleValue }
     @objc private func lyricsOpacityChanged(_ sender: NSSlider) { settings.desktopLyricsBackgroundOpacity = sender.doubleValue }
+    @objc private func mainWindowOpacityChanged(_ sender: NSSlider) { settings.mainWindowBackgroundOpacity = sender.doubleValue }
     @objc private func paletteChanged(_ sender: NSPopUpButton) {
         guard let palette = SubtitlePalette.presets[safeSettings: sender.indexOfSelectedItem] else {
             settings.subtitlePaletteID = "custom"

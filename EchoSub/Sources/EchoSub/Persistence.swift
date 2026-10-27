@@ -194,6 +194,14 @@ final class AppSettings {
         set { update(min(1, max(0, newValue)), key: "floatingBackgroundOpacity", current: floatingBackgroundOpacity) }
     }
 
+    var mainWindowBackgroundOpacity: Double {
+        get {
+            guard defaults.object(forKey: "mainWindowBackgroundOpacity") != nil else { return 0.55 }
+            return min(1, max(0, defaults.double(forKey: "mainWindowBackgroundOpacity")))
+        }
+        set { update(min(1, max(0, newValue)), key: "mainWindowBackgroundOpacity", current: mainWindowBackgroundOpacity) }
+    }
+
     var subtitlePaletteID: String {
         get { defaults.string(forKey: "subtitlePaletteID") ?? SubtitlePalette.defaultPalette.id }
         set { update(newValue, key: "subtitlePaletteID", current: subtitlePaletteID) }
@@ -241,7 +249,7 @@ final class AppSettings {
     var supadataAPIKey: String { PlaintextCredentialStore.shared.loadSupadataAPIKey() }
 
     func reset() {
-        ["subtitleMode", "autoFollow", "playbackLoopMode", "translationBaseURL", "translationModel", "overlayFontSize", "desktopEnglishFontSize", "desktopChineseFontSize", "overlayPlateEnabled", "desktopLyricsBackgroundOpacity", "floatingBackgroundOpacity", "subtitlePaletteID", "englishColorHex", "chineseColorHex", "englishFillHex", "englishEdgeHex", "chineseFillHex", "chineseEdgeHex", "floatPinned", "showsOnAllSpaces", "mainPlaylistWidth", "mainSubtitleWidth"].forEach(defaults.removeObject(forKey:))
+        ["subtitleMode", "autoFollow", "playbackLoopMode", "translationBaseURL", "translationModel", "overlayFontSize", "desktopEnglishFontSize", "desktopChineseFontSize", "overlayPlateEnabled", "desktopLyricsBackgroundOpacity", "floatingBackgroundOpacity", "mainWindowBackgroundOpacity", "subtitlePaletteID", "englishColorHex", "chineseColorHex", "englishFillHex", "englishEdgeHex", "chineseFillHex", "chineseEdgeHex", "floatPinned", "showsOnAllSpaces", "mainPlaylistWidth", "mainSubtitleWidth"].forEach(defaults.removeObject(forKey:))
         changed()
     }
 
